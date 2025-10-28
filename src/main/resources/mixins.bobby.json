@@ -1,0 +1,21 @@
+{
+  "required": true,
+  "minVersion": "0.8",
+  "package": "com.michaelsebero.bobby.mixin",
+  "refmap": "mixins.bobby.refmap.json",
+  "plugin": "com.michaelsebero.bobby.compat.CompatibilityMixinPlugin",
+  "compatibilityLevel": "JAVA_8",
+  "client": [
+    "AnvilChunkLoaderMixin",
+    "AnvilChunkLoaderAccessor",
+    "ChunkProviderClientMixin",
+    "IntegratedServerMixin",
+    "MinecraftMixin",
+    "NetHandlerPlayClientMixin",
+    "vintagium.SodiumGameOptionPagesMixin",
+    "vintagium.VintagiumChunkProviderMixin"
+  ],
+  "injectors": {
+    "defaultRequire": 1
+  }
+}

@@ -24,7 +24,7 @@ repositories {
 }
 
 dependencies {
-    def mixinBooter = modUtils.enableMixins("zone.rong:mixinbooter:8.9", "mixins.chunkbert.refmap.json")
+    def mixinBooter = modUtils.enableMixins("zone.rong:mixinbooter:8.9", "mixins.bobby.refmap.json")
     api (mixinBooter) {
         transitive = false
     }
@@ -39,7 +39,7 @@ dependencies {
 }
 
 def coreModManifest = {
-    attributes "FMLCorePlugin": "com.embeddedt.chunkbert.core.ChunkbertPlugin"
+    attributes "FMLCorePlugin": "com.michaelsebero.bobby.core.BobbyPlugin"
     attributes "FMLCorePluginContainsFMLMod": true
     attributes "ForceLoadAsMod": true
     attributes "Maven-Artifact": "${group}:${name}:${version}"
