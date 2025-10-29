@@ -18,9 +18,12 @@ public class BobbyConfig {
     @Config.RangeInt(min = 0, max = 300)
     public static int unloadDelaySecs = 60;
 
-    @Config.Comment("Changes the maximum value configurable for Render Distance.\n" +
-            "Requires Sodium/Vintagium.")
-    @Config.RangeInt(min = 2, max = 64)
+    @Config.Comment("Current render distance setting.\n" +
+            "This value is automatically synchronized with the in-game slider.\n" +
+            "You can adjust this in Video Settings (2-1816 chunks) or edit this config directly.\n" +
+            "WARNING: Values above 64 may cause severe performance issues!\n" +
+            "Recommended: 32-64 for most systems, 128+ only for high-end systems with 16GB+ RAM.")
+    @Config.RangeInt(min = 2, max = 1816)
     public static int maxRenderDistance = 32;
     
     @Config.Comment("Overwrites the view-distance of the integrated server.\n" +
