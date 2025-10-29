@@ -12,15 +12,23 @@ import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
 @Mixin(Minecraft.class)
-public class MinecraftMixin {
+public abstract class MinecraftMixin {
     @Shadow public WorldClient world;
     @Shadow public GameSettings gameSettings;
+    @Shadow public net.minecraft.profiler.Profiler profiler;
     
-    private long lastUpdateTime = 0;
-    private static final long MIN_UPDATE_INTERVAL_MS = 50;
+    private long bobby$lastUpdateTime = 0;
+    private static final long BOBBY$MIN_UPDATE_INTERVAL_MS = 50;
 
-    @Inject(method = "runGameLoop", at = @At(value = "CONSTANT", args = "stringValue=tick"))
-    private void bobbyUpdate(CallbackInfo ci) {
+    @Inject(
+        method = "runGameLoop",
+        at = @At(
+            value = "INVOKE",
+            target = "Lnet/minecraft/profiler/Profiler;startSection(Ljava/lang/String;)V",
+            ordinal = 0
+        )
+    )
+    private void bobby$updateBeforeTick(CallbackInfo ci) {
         if (world == null) {
             return;
         }
@@ -31,13 +39,12 @@ public class MinecraftMixin {
         }
 
         long currentTime = System.currentTimeMillis();
-        if (currentTime - lastUpdateTime < MIN_UPDATE_INTERVAL_MS) {
+        if (currentTime - bobby$lastUpdateTime < BOBBY$MIN_UPDATE_INTERVAL_MS) {
             return;
         }
-        lastUpdateTime = currentTime;
+        bobby$lastUpdateTime = currentTime;
 
-        Minecraft mc = (Minecraft)(Object)this;
-        mc.profiler.startSection("bobbyUpdate");
+        profiler.startSection("bobbyUpdate");
 
         int maxFps = gameSettings.limitFramerate;
         if (maxFps == 0 || maxFps == GameSettings.Options.FRAMERATE_LIMIT.getValueMax()) {
@@ -50,11 +57,11 @@ public class MinecraftMixin {
         
         bobbyChunkManager.update(() -> System.nanoTime() < timeLimit);
 
-        mc.profiler.endSection();
+        profiler.endSection();
     }
     
     @Inject(method = "shutdown", at = @At("HEAD"))
-    private void bobbyShutdown(CallbackInfo ci) {
+    private void bobby$shutdown(CallbackInfo ci) {
         if (world != null) {
             FakeChunkManager manager = ((IChunkProviderClient) world.getChunkProvider()).getBobbyChunkManager();
             if (manager != null) {
