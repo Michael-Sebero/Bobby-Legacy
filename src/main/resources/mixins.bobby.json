@@ -11,12 +11,9 @@
     "ChunkProviderClientMixin",
     "GameSettingsMixin",
     "GameSettings$OptionsMixin",
-    "GuiVideoSettingsMixin",
     "IntegratedServerMixin",
     "MinecraftMixin",
-    "NetHandlerPlayClientMixin",
-    "vintagium.SodiumGameOptionPagesMixin",
-    "vintagium.VintagiumChunkProviderMixin"
+    "NetHandlerPlayClientMixin"
   ],
   "injectors": {
     "defaultRequire": 1

@@ -9,16 +9,6 @@ import org.spongepowered.asm.mixin.extensibility.IMixinInfo;
 
 public class CompatibilityMixinPlugin implements IMixinConfigPlugin {
 
-    private static boolean vintagiumLoaded;
-
-    static {
-        try {
-            Class.forName("me.jellysquid.mods.sodium.client.SodiumMixinTweaker");
-            vintagiumLoaded = true;
-        } catch (NoClassDefFoundError | ClassNotFoundException ignored) {
-        }
-    }
-
     @Override
     public void onLoad(String mixinPackage) { }
 
@@ -29,11 +19,8 @@ public class CompatibilityMixinPlugin implements IMixinConfigPlugin {
 
     @Override
     public boolean shouldApplyMixin(String targetClassName, String mixinClassName) {
-        if(!mixinClassName.contains("vintagium")) {
-            return true;
-        }
-
-        return vintagiumLoaded;
+        // All mixins should apply now that Vintagium support is removed
+        return true;
     }
 
     @Override

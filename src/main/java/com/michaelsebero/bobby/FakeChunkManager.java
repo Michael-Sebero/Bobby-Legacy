@@ -1,11 +1,7 @@
 package com.michaelsebero.bobby;
 
-import com.michaelsebero.bobby.BobbyConfig;
-import com.michaelsebero.bobby.compat.IChunkStatusListener;
-import com.michaelsebero.bobby.ext.ChunkProviderClientExt;
 import io.netty.util.concurrent.DefaultThreadFactory;
 import it.unimi.dsi.fastutil.longs.*;
-import it.unimi.dsi.fastutil.objects.ObjectIterator;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.entity.EntityPlayerSP;
 import net.minecraft.client.multiplayer.ChunkProviderClient;
@@ -22,7 +18,7 @@ import javax.annotation.Nullable;
 import java.io.File;
 import java.io.IOException;
 import java.nio.file.Path;
-import java.util.Optional;
+import java.util.*;
 import java.util.concurrent.*;
 import java.util.function.BooleanSupplier;
 import java.util.function.Supplier;
@@ -30,48 +26,58 @@ import java.util.function.Supplier;
 public class FakeChunkManager {
     private static final String FALLBACK_LEVEL_NAME = "bobby-fallback";
     private static final Minecraft client = Minecraft.getMinecraft();
-    private static final int SAVE_INTERVAL_TICKS = 20 * 60; // 1 minute
-    private static final int MAX_CHUNKS_PER_TICK = 4; // Limit chunk processing per tick
-    private static final int LOADING_THREAD_POOL_SIZE = 4; // Reduced from 8
+    private static final int SAVE_INTERVAL_TICKS = 20 * 60;
 
     private final WorldClient world;
     private final ChunkProviderClient clientChunkManager;
-    private final ChunkProviderClientExt clientChunkManagerExt;
     private int ticksSinceLastSave;
     private final FakeChunkStorage storage;
     private final FakeChunkStorage fallbackStorage;
 
-    // Use thread-safe collections more efficiently
     private final Long2ObjectMap<Chunk> fakeChunks = Long2ObjectMaps.synchronize(new Long2ObjectOpenHashMap<>());
     private int centerX, centerZ, viewDistance;
-    private final Long2LongMap toBeUnloaded = new Long2LongOpenHashMap();
-    
-    // Use priority queue for better unload ordering
-    private final ConcurrentLinkedDeque<Pair<Long, Long>> unloadQueue = new ConcurrentLinkedDeque<>();
+    private final Long2LongMap toBeUnloaded = Long2LongMaps.synchronize(new Long2LongOpenHashMap());
+    private final PriorityBlockingQueue<UnloadTask> unloadQueue = new PriorityBlockingQueue<>(256, 
+        Comparator.comparingLong(UnloadTask::getUnloadTime));
 
-    // Optimized thread pool with better configuration
-    private static final ExecutorService loadExecutor = new ThreadPoolExecutor(
-        2, // core pool size
-        LOADING_THREAD_POOL_SIZE, // max pool size
-        60L, TimeUnit.SECONDS, // keep alive time
-        new LinkedBlockingQueue<>(256), // bounded queue to prevent memory issues
-        new DefaultThreadFactory("bobby-loading", true),
-        new ThreadPoolExecutor.CallerRunsPolicy() // backpressure handling
-    );
+    // Instance-specific executors that won't be shared
+    private final ExecutorService loadExecutor;
+    private final ScheduledExecutorService saveExecutor;
     
     private final ConcurrentHashMap<Long, LoadingJob> loadingJobs = new ConcurrentHashMap<>();
+    private final BlockingQueue<LoadingJob> completedJobs = new LinkedBlockingQueue<>();
     
-    // Cache for position calculations
-    private final LongSet loadedChunkPositions = new LongOpenHashSet();
-    
-    // Batch processing optimization
-    private final LongList chunksToLoad = new LongArrayList();
-    private final LongList chunksToUnload = new LongArrayList();
+    // Thread-safe LRU cache for chunk tags
+    private final Map<Long, NBTTagCompound> chunkTagCache = Collections.synchronizedMap(
+        new LinkedHashMap<Long, NBTTagCompound>(BobbyConfig.maxCacheSize, 0.75f, true) {
+            @Override
+            protected boolean removeEldestEntry(Map.Entry<Long, NBTTagCompound> eldest) {
+                return size() > BobbyConfig.maxCacheSize;
+            }
+        }
+    );
+
+    private final PerformanceMonitor perfMonitor = PerformanceMonitor.getInstance();
+    private final Set<Long> chunksInLoadQueue = ConcurrentHashMap.newKeySet();
+    private final Map<Long, ScheduledLoad> scheduledLoads = new ConcurrentHashMap<>();
 
     public FakeChunkManager(WorldClient world, ChunkProviderClient clientChunkManager) {
         this.world = world;
         this.clientChunkManager = clientChunkManager;
-        this.clientChunkManagerExt = (ChunkProviderClientExt) clientChunkManager;
+
+        // Create instance-specific executors
+        this.loadExecutor = new ThreadPoolExecutor(
+            Math.max(1, BobbyConfig.loadingThreads / 2),
+            BobbyConfig.loadingThreads,
+            60L, TimeUnit.SECONDS,
+            new LinkedBlockingQueue<>(512),
+            new DefaultThreadFactory("bobby-loading-" + world.provider.getDimension(), true),
+            new ThreadPoolExecutor.CallerRunsPolicy()
+        );
+        
+        this.saveExecutor = Executors.newSingleThreadScheduledExecutor(
+            new DefaultThreadFactory("bobby-saving-" + world.provider.getDimension(), true)
+        );
 
         long seedHash = 123456;
         DimensionType worldKey = world.provider.getDimensionType();
@@ -93,8 +99,21 @@ public class FakeChunkManager {
             fallbackStorage = FakeChunkStorage.getFor(regionDirectory, null);
         }
         this.fallbackStorage = fallbackStorage;
+        
+        // Schedule periodic auto-save
+        if (BobbyConfig.asyncSaving) {
+            saveExecutor.scheduleAtFixedRate(() -> {
+                try {
+                    storage.processPendingSaves();
+                    storage.writeNextIO();
+                } catch (Exception e) {
+                    Bobby.LOGGER.error("Error during auto-save", e);
+                }
+            }, BobbyConfig.autoSaveInterval, BobbyConfig.autoSaveInterval, TimeUnit.SECONDS);
+        }
     }
 
+    @Nullable
     public Chunk getChunk(int x, int z) {
         return fakeChunks.get(ChunkPos.asLong(x, z));
     }
@@ -104,48 +123,57 @@ public class FakeChunkManager {
     }
 
     public void update(BooleanSupplier shouldKeepTicking) {
-        // Periodic save optimization - async execution
-        if (++ticksSinceLastSave > SAVE_INTERVAL_TICKS) {
-            loadExecutor.execute(() -> storage.writeNextIO());
-            ticksSinceLastSave = 0;
-        }
-
-        EntityPlayerSP player = client.player;
-        if (player == null) {
-            return;
-        }
-
-        long time = System.currentTimeMillis(); // Use currentTimeMillis instead of nanoTime for timestamps
-
-        int oldCenterX = this.centerX;
-        int oldCenterZ = this.centerZ;
-        int oldViewDistance = this.viewDistance;
-        int newCenterX = player.chunkCoordX;
-        int newCenterZ = player.chunkCoordZ;
-        int newViewDistance = client.gameSettings.renderDistanceChunks;
+        long startTime = System.nanoTime();
         
-        if (oldCenterX != newCenterX || oldCenterZ != newCenterZ || oldViewDistance != newViewDistance) {
-            updateChunkLoadingRegion(oldCenterX, oldCenterZ, oldViewDistance, 
-                                     newCenterX, newCenterZ, newViewDistance, time);
+        try {
+            if (++ticksSinceLastSave > SAVE_INTERVAL_TICKS) {
+                if (BobbyConfig.asyncSaving) {
+                    loadExecutor.execute(() -> {
+                        storage.processPendingSaves();
+                        storage.writeNextIO();
+                    });
+                } else {
+                    storage.writeNextIO();
+                }
+                ticksSinceLastSave = 0;
+            }
+
+            EntityPlayerSP player = client.player;
+            if (player == null) {
+                return;
+            }
+
+            long time = System.currentTimeMillis();
+
+            int oldCenterX = this.centerX;
+            int oldCenterZ = this.centerZ;
+            int oldViewDistance = this.viewDistance;
+            int newCenterX = player.chunkCoordX;
+            int newCenterZ = player.chunkCoordZ;
+            int newViewDistance = Math.min(client.gameSettings.renderDistanceChunks, BobbyConfig.maxRenderDistance);
             
-            this.centerX = newCenterX;
-            this.centerZ = newCenterZ;
-            this.viewDistance = newViewDistance;
+            if (oldCenterX != newCenterX || oldCenterZ != newCenterZ || oldViewDistance != newViewDistance) {
+                updateChunkLoadingRegion(oldCenterX, oldCenterZ, oldViewDistance, 
+                                         newCenterX, newCenterZ, newViewDistance, time);
+                
+                this.centerX = newCenterX;
+                this.centerZ = newCenterZ;
+                this.viewDistance = newViewDistance;
+            }
+
+            processUnloadQueue(time, shouldKeepTicking);
+            processCompletedJobs(shouldKeepTicking);
+            processScheduledLoads();
+        } finally {
+            if (BobbyConfig.enablePerformanceMonitoring) {
+                perfMonitor.recordUpdateTime(System.nanoTime() - startTime);
+            }
         }
-
-        // Process unload queue with throttling
-        processUnloadQueue(time, shouldKeepTicking);
-
-        // Process loading jobs with limit
-        processLoadingJobs(shouldKeepTicking);
     }
 
     private void updateChunkLoadingRegion(int oldCenterX, int oldCenterZ, int oldViewDistance,
                                           int newCenterX, int newCenterZ, int newViewDistance, long time) {
-        chunksToLoad.clear();
-        chunksToUnload.clear();
         
-        // Calculate chunks to unload
         int minOldX = oldCenterX - oldViewDistance;
         int maxOldX = oldCenterX + oldViewDistance;
         int minOldZ = oldCenterZ - oldViewDistance;
@@ -156,83 +184,80 @@ public class FakeChunkManager {
         int minNewZ = newCenterZ - newViewDistance;
         int maxNewZ = newCenterZ + newViewDistance;
         
-        // Batch unload operations
+        // Find chunks to unload (now outside view distance)
         for (int x = minOldX; x <= maxOldX; x++) {
             boolean xOutside = x < minNewX || x > maxNewX;
             for (int z = minOldZ; z <= maxOldZ; z++) {
                 if (xOutside || z < minNewZ || z > maxNewZ) {
                     long chunkPos = ChunkPos.asLong(x, z);
-                    chunksToUnload.add(chunkPos);
+                    cancelLoad(x, z);
+                    
+                    long unloadTime = time + (BobbyConfig.unloadDelaySecs * 1000L);
+                    toBeUnloaded.put(chunkPos, unloadTime);
+                    unloadQueue.offer(new UnloadTask(chunkPos, unloadTime));
                 }
             }
         }
         
-        // Process unloads in batch
-        for (long chunkPos : chunksToUnload) {
-            int x = ChunkPosHelper.getPackedX(chunkPos);
-            int z = ChunkPosHelper.getPackedZ(chunkPos);
-            cancelLoad(x, z);
-            toBeUnloaded.put(chunkPos, time);
-            unloadQueue.add(Pair.of(chunkPos, time));
-        }
-        
-        // Batch load operations
+        // Find chunks to load, prioritized by distance from center
+        List<ChunkLoadTask> loadTasks = new ArrayList<>();
         for (int x = minNewX; x <= maxNewX; x++) {
             boolean xOutside = x < minOldX || x > maxOldX;
             for (int z = minNewZ; z <= maxNewZ; z++) {
                 if (xOutside || z < minOldZ || z > maxOldZ) {
                     long chunkPos = ChunkPos.asLong(x, z);
-                    chunksToLoad.add(chunkPos);
+                    int distSq = (x - newCenterX) * (x - newCenterX) + (z - newCenterZ) * (z - newCenterZ);
+                    loadTasks.add(new ChunkLoadTask(chunkPos, distSq));
                 }
             }
         }
         
-        // Process loads in batch
-        for (long chunkPos : chunksToLoad) {
+        // Sort by distance (closest first)
+        loadTasks.sort(Comparator.comparingInt(t -> t.distanceSquared));
+        
+        // Queue loads
+        for (ChunkLoadTask task : loadTasks) {
+            long chunkPos = task.chunkPos;
             int x = ChunkPosHelper.getPackedX(chunkPos);
             int z = ChunkPosHelper.getPackedZ(chunkPos);
             
+            // Cancel unload if it was scheduled
             toBeUnloaded.remove(chunkPos);
             
             if (clientChunkManager.getLoadedChunk(x, z) != null) {
                 continue;
             }
             
-            // Only queue if we're not already loading it
-            if (!loadingJobs.containsKey(chunkPos)) {
-                LoadingJob loadingJob = new LoadingJob(x, z);
-                loadingJobs.put(chunkPos, loadingJob);
-                loadExecutor.execute(loadingJob);
+            // Avoid duplicate loads
+            if (!chunksInLoadQueue.add(chunkPos)) {
+                continue;
             }
+            
+            LoadingJob loadingJob = new LoadingJob(x, z, task.distanceSquared);
+            loadingJobs.put(chunkPos, loadingJob);
+            loadExecutor.execute(loadingJob);
         }
     }
 
     private void processUnloadQueue(long currentTime, BooleanSupplier shouldKeepTicking) {
-        long unloadTime = currentTime - BobbyConfig.unloadDelaySecs * 1000L;
         int processed = 0;
         
-        while (processed < MAX_CHUNKS_PER_TICK) {
-            Pair<Long, Long> next = unloadQueue.pollFirst();
-            if (next == null) {
+        while (processed < BobbyConfig.maxChunksPerTick) {
+            UnloadTask task = unloadQueue.peek();
+            if (task == null || task.unloadTime > currentTime) {
                 break;
             }
             
-            long chunkPos = next.getLeft();
-            long queuedTime = next.getRight();
+            unloadQueue.poll();
+            long chunkPos = task.chunkPos;
 
-            if (queuedTime > unloadTime) {
-                unloadQueue.addFirst(next);
-                break;
-            }
-
-            long actualQueuedTime = toBeUnloaded.remove(chunkPos);
-            if (actualQueuedTime != queuedTime) {
-                if (actualQueuedTime != 0) {
-                    toBeUnloaded.put(chunkPos, actualQueuedTime);
-                }
+            // Double-check if still scheduled for unload
+            long scheduledTime = toBeUnloaded.get(chunkPos);
+            if (scheduledTime == 0 || scheduledTime != task.unloadTime) {
                 continue;
             }
 
+            toBeUnloaded.remove(chunkPos);
             unload(ChunkPosHelper.getPackedX(chunkPos), ChunkPosHelper.getPackedZ(chunkPos), false);
             processed++;
             
@@ -242,23 +267,22 @@ public class FakeChunkManager {
         }
     }
 
-    private void processLoadingJobs(BooleanSupplier shouldKeepTicking) {
+    private void processCompletedJobs(BooleanSupplier shouldKeepTicking) {
         int processed = 0;
-        java.util.Iterator<LoadingJob> iter = loadingJobs.values().iterator();
         
-        while (iter.hasNext() && processed < MAX_CHUNKS_PER_TICK) {
-            LoadingJob job = iter.next();
-            
-            if (job.result == null) {
-                continue;
-            }
-
-            iter.remove();
+        while (processed < BobbyConfig.maxChunksPerTick && !completedJobs.isEmpty()) {
+            LoadingJob job = completedJobs.poll();
+            if (job == null) break;
             
             if (!job.cancelled) {
+                long startTime = System.nanoTime();
                 client.profiler.startSection("loadFakeChunk");
                 job.complete();
                 client.profiler.endSection();
+                
+                if (BobbyConfig.enablePerformanceMonitoring) {
+                    perfMonitor.recordLoadTime(System.nanoTime() - startTime);
+                }
                 processed++;
             }
 
@@ -268,22 +292,61 @@ public class FakeChunkManager {
         }
     }
 
-    private @Nullable Pair<NBTTagCompound, FakeChunkStorage> loadTag(int x, int z) {
-        ChunkPos chunkPos = new ChunkPos(x, z);
+    private void processScheduledLoads() {
+        if (scheduledLoads.isEmpty()) return;
+        
+        Iterator<Map.Entry<Long, ScheduledLoad>> iterator = scheduledLoads.entrySet().iterator();
+        while (iterator.hasNext()) {
+            Map.Entry<Long, ScheduledLoad> entry = iterator.next();
+            ScheduledLoad scheduled = entry.getValue();
+            
+            // Only load if the real chunk hasn't been loaded yet
+            if (clientChunkManager.getLoadedChunk(scheduled.x, scheduled.z) == null) {
+                load(scheduled.x, scheduled.z, scheduled.tag, scheduled.storage);
+            }
+            iterator.remove();
+        }
+    }
+
+    @Nullable
+    private Pair<NBTTagCompound, FakeChunkStorage> loadTag(int x, int z) {
+        long chunkPos = ChunkPos.asLong(x, z);
+        
+        // Check cache first
+        synchronized (chunkTagCache) {
+            NBTTagCompound cached = chunkTagCache.get(chunkPos);
+            if (cached != null) {
+                if (BobbyConfig.enablePerformanceMonitoring) {
+                    perfMonitor.recordCacheHit();
+                }
+                return Pair.of(cached.copy(), storage);
+            }
+        }
+        
+        if (BobbyConfig.enablePerformanceMonitoring) {
+            perfMonitor.recordCacheMiss();
+        }
+        
         try {
-            NBTTagCompound tag = storage.loadTag(chunkPos);
+            NBTTagCompound tag = storage.loadTag(new ChunkPos(x, z));
             if (tag != null) {
+                synchronized (chunkTagCache) {
+                    chunkTagCache.put(chunkPos, tag.copy());
+                }
                 return Pair.of(tag, storage);
             }
+            
             if (fallbackStorage != null) {
-                tag = fallbackStorage.loadTag(chunkPos);
+                tag = fallbackStorage.loadTag(new ChunkPos(x, z));
                 if (tag != null) {
+                    synchronized (chunkTagCache) {
+                        chunkTagCache.put(chunkPos, tag.copy());
+                    }
                     return Pair.of(tag, fallbackStorage);
                 }
             }
         } catch (IOException e) {
-            // Log error but don't crash
-            System.err.println("Error loading chunk at " + x + ", " + z + ": " + e.getMessage());
+            Bobby.LOGGER.error("Error loading chunk at {}, {}", x, z, e);
         }
         return null;
     }
@@ -299,14 +362,12 @@ public class FakeChunkManager {
     protected void load(int x, int z, Chunk chunk) {
         long pos = ChunkPos.asLong(x, z);
         fakeChunks.put(pos, chunk);
-        loadedChunkPositions.add(pos);
+        
+        if (BobbyConfig.enablePerformanceMonitoring) {
+            perfMonitor.recordChunkLoaded();
+        }
 
         world.markBlockRangeForRenderUpdate(x << 4, 0, z << 4, (x << 4) + 15, 256, (z << 4) + 15);
-
-        IChunkStatusListener listener = clientChunkManagerExt.bobby_getListener();
-        if (listener != null) {
-            listener.onChunkAdded(x, z);
-        }
     }
 
     public boolean unload(int x, int z, boolean willBeReplaced) {
@@ -315,19 +376,19 @@ public class FakeChunkManager {
         Chunk chunk = fakeChunks.remove(pos);
         
         if (chunk != null) {
-            loadedChunkPositions.remove(pos);
-            chunk.onUnload();
-
-            // Batch removal optimization
-            world.loadedTileEntityList.removeAll(chunk.getTileEntityMap().values());
-            world.tickableTileEntities.removeAll(chunk.getTileEntityMap().values());
-
-            if (!willBeReplaced) {
-                IChunkStatusListener listener = clientChunkManagerExt.bobby_getListener();
-                if (listener != null) {
-                    listener.onChunkRemoved(x, z);
-                }
+            if (BobbyConfig.enablePerformanceMonitoring) {
+                perfMonitor.recordChunkUnloaded();
             }
+            
+            // Clean up chunk resources
+            try {
+                chunk.onUnload();
+                world.loadedTileEntityList.removeAll(chunk.getTileEntityMap().values());
+                world.tickableTileEntities.removeAll(chunk.getTileEntityMap().values());
+            } catch (Exception e) {
+                Bobby.LOGGER.error("Error unloading chunk at {}, {}", x, z, e);
+            }
+
             return true;
         }
 
@@ -335,21 +396,28 @@ public class FakeChunkManager {
     }
 
     private void cancelLoad(int x, int z) {
-        LoadingJob job = loadingJobs.remove(ChunkPos.asLong(x, z));
+        long chunkPos = ChunkPos.asLong(x, z);
+        chunksInLoadQueue.remove(chunkPos);
+        LoadingJob job = loadingJobs.remove(chunkPos);
         if (job != null) {
             job.cancelled = true;
         }
+    }
+    
+    public void scheduleLoadAfterUnload(int x, int z, NBTTagCompound tag, FakeChunkStorage storage) {
+        long pos = ChunkPos.asLong(x, z);
+        scheduledLoads.put(pos, new ScheduledLoad(x, z, tag, storage));
     }
 
     private static String getCurrentWorldOrServerName() {
         IntegratedServer integratedServer = client.getIntegratedServer();
         if (integratedServer != null) {
-            return integratedServer.getWorldName();
+            return sanitizeFileName(integratedServer.getWorldName());
         }
 
         ServerData serverInfo = client.getCurrentServerData();
         if (serverInfo != null) {
-            return serverInfo.serverIP.replace(':', '_');
+            return sanitizeFileName(serverInfo.serverIP.replace(':', '_'));
         }
 
         if (client.isConnectedToRealms()) {
@@ -358,40 +426,113 @@ public class FakeChunkManager {
 
         return "unknown";
     }
+    
+    private static String sanitizeFileName(String name) {
+        return name.replaceAll("[^a-zA-Z0-9._-]", "_");
+    }
 
     public String getDebugString() {
-        return String.format("F: %d L: %d U: %d Q: %d", 
+        int queueSize = loadExecutor instanceof ThreadPoolExecutor ? 
+            ((ThreadPoolExecutor)loadExecutor).getQueue().size() : 0;
+        return String.format("F: %d L: %d U: %d Q: %d C: %d", 
             fakeChunks.size(), 
             loadingJobs.size(), 
             toBeUnloaded.size(),
-            ((ThreadPoolExecutor)loadExecutor).getQueue().size());
+            queueSize,
+            completedJobs.size());
     }
     
     public void shutdown() {
+        Bobby.LOGGER.info("Shutting down chunk manager for dimension {}...", world.provider.getDimension());
+        
+        // Cancel all pending loads
+        for (LoadingJob job : loadingJobs.values()) {
+            job.cancelled = true;
+        }
+        loadingJobs.clear();
+        completedJobs.clear();
+        
+        // Flush any pending saves
+        try {
+            storage.flushPendingSaves();
+        } catch (Exception e) {
+            Bobby.LOGGER.error("Error flushing storage during shutdown", e);
+        }
+        
+        // Shutdown this instance's executors
         loadExecutor.shutdown();
+        saveExecutor.shutdown();
+        
         try {
             if (!loadExecutor.awaitTermination(5, TimeUnit.SECONDS)) {
                 loadExecutor.shutdownNow();
             }
+            if (!saveExecutor.awaitTermination(5, TimeUnit.SECONDS)) {
+                saveExecutor.shutdownNow();
+            }
         } catch (InterruptedException e) {
             loadExecutor.shutdownNow();
+            saveExecutor.shutdownNow();
+            Thread.currentThread().interrupt();
+        }
+        
+        Bobby.LOGGER.info("Chunk manager shutdown complete");
+    }
+
+    private static class UnloadTask {
+        final long chunkPos;
+        final long unloadTime;
+
+        UnloadTask(long chunkPos, long unloadTime) {
+            this.chunkPos = chunkPos;
+            this.unloadTime = unloadTime;
+        }
+
+        long getUnloadTime() {
+            return unloadTime;
+        }
+    }
+    
+    private static class ChunkLoadTask {
+        final long chunkPos;
+        final int distanceSquared;
+        
+        ChunkLoadTask(long chunkPos, int distanceSquared) {
+            this.chunkPos = chunkPos;
+            this.distanceSquared = distanceSquared;
+        }
+    }
+    
+    private static class ScheduledLoad {
+        final int x, z;
+        final NBTTagCompound tag;
+        final FakeChunkStorage storage;
+        
+        ScheduledLoad(int x, int z, NBTTagCompound tag, FakeChunkStorage storage) {
+            this.x = x;
+            this.z = z;
+            this.tag = tag;
+            this.storage = storage;
         }
     }
 
     private class LoadingJob implements Runnable {
         private final int x;
         private final int z;
+        private final int priority;
         private volatile boolean cancelled;
         private volatile Optional<Supplier<Chunk>> result;
 
-        public LoadingJob(int x, int z) {
+        public LoadingJob(int x, int z, int priority) {
             this.x = x;
             this.z = z;
+            this.priority = priority;
         }
 
         @Override
         public void run() {
             if (cancelled) {
+                cleanup();
                 return;
             }
             
@@ -404,9 +545,16 @@ public class FakeChunkManager {
                 } else {
                     result = Optional.empty();
                 }
+                
+                if (!cancelled) {
+                    completedJobs.offer(this);
+                } else {
+                    cleanup();
+                }
             } catch (Exception e) {
-                System.err.println("Error in loading job for chunk " + x + ", " + z + ": " + e.getMessage());
+                Bobby.LOGGER.error("Error in loading job for chunk {}, {}", x, z, e);
                 result = Optional.empty();
+                cleanup();
             }
         }
 
@@ -414,10 +562,21 @@ public class FakeChunkManager {
             if (result != null) {
                 result.ifPresent(supplier -> {
                     if (!cancelled) {
-                        load(x, z, supplier.get());
+                        try {
+                            load(x, z, supplier.get());
+                        } catch (Exception e) {
+                            Bobby.LOGGER.error("Error completing load for chunk {}, {}", x, z, e);
+                        }
                     }
                 });
             }
+            cleanup();
+        }
+        
+        private void cleanup() {
+            long chunkPos = ChunkPos.asLong(x, z);
+            loadingJobs.remove(chunkPos);
+            chunksInLoadQueue.remove(chunkPos);
         }
     }
 }
