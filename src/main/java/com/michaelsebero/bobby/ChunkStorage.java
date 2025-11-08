@@ -13,6 +13,7 @@ import net.minecraft.world.chunk.storage.RegionFile;
 
 import javax.annotation.Nullable;
 import java.io.*;
+import java.lang.reflect.Method;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -20,7 +21,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 /**
  * Handles chunk NBT serialization and disk I/O
  * PERFORMANCE OPTIMIZED: Async saves, reduced blocking
- * FIXED: Direct region file writing instead of using RegionFileCache
+ * FIXED: Thread-safe data fixing + universal deserialization for all world types
  */
 public class ChunkStorage extends AnvilChunkLoader {
     private final ConcurrentHashMap<Long, NBTTagCompound> pending = new ConcurrentHashMap<>();
@@ -29,13 +30,54 @@ public class ChunkStorage extends AnvilChunkLoader {
     // Our own region file cache for Bobby's directory
     private final Map<String, RegionFile> regionCache = new HashMap<>();
     
+    // Cache reflection method for universal chunk reading
+    private static Method readChunkFromNBTMethod = null;
+    private static boolean reflectionFailed = false;
+    
+    // CRITICAL: Synchronize data fixer access to prevent ConcurrentModificationException
+    private static final Object dataFixerLock = new Object();
+    
     public ChunkStorage(File dir) {
         super(dir, Minecraft.getMinecraft().getDataFixer());
+        initializeReflection();
     }
     
     public static ChunkStorage create(File dir) {
         dir.mkdirs();
         return new ChunkStorage(dir);
+    }
+
+    /**
+     * Initialize reflection access to AnvilChunkLoader's readChunkFromNBT method
+     * This method is more universal and doesn't depend on world generators
+     */
+    private static void initializeReflection() {
+        if (readChunkFromNBTMethod != null || reflectionFailed) {
+            return;
+        }
+        
+        try {
+            // Try to find the readChunkFromNBT method
+            // This is the lower-level method that just reads NBT data without generator logic
+            for (Method method : AnvilChunkLoader.class.getDeclaredMethods()) {
+                // Look for method with signature: Chunk readChunkFromNBT(World, NBTTagCompound)
+                if (method.getReturnType() == Chunk.class && 
+                    method.getParameterCount() == 2) {
+                    method.setAccessible(true);
+                    readChunkFromNBTMethod = method;
+                    Bobby.LOGGER.info("Successfully initialized reflection for universal chunk deserialization");
+                    break;
+                }
+            }
+            
+            if (readChunkFromNBTMethod == null) {
+                Bobby.LOGGER.warn("Could not find readChunkFromNBT method, falling back to standard deserialization");
+                reflectionFailed = true;
+            }
+        } catch (Exception e) {
+            Bobby.LOGGER.error("Failed to initialize reflection for chunk deserialization", e);
+            reflectionFailed = true;
+        }
     }
 
     /**
@@ -75,7 +117,6 @@ public class ChunkStorage extends AnvilChunkLoader {
 
     /**
      * Scan region files to discover all stored chunks
-     * This is called on world load to restore previously cached chunks
      */
     public Set<ChunkPos> getStoredChunks() {
         Set<ChunkPos> chunks = new HashSet<>();
@@ -96,7 +137,6 @@ public class ChunkStorage extends AnvilChunkLoader {
         
         for (File regionFile : regionFiles) {
             try {
-                // Parse region coordinates from filename: r.X.Z.mca
                 String name = regionFile.getName();
                 String[] parts = name.replace(".mca", "").split("\\.");
                 if (parts.length != 3) continue;
@@ -104,16 +144,13 @@ public class ChunkStorage extends AnvilChunkLoader {
                 int regionX = Integer.parseInt(parts[1]);
                 int regionZ = Integer.parseInt(parts[2]);
                 
-                // Open region file directly
                 RegionFile region = new RegionFile(regionFile);
                 
-                // Each region contains 32x32 chunks
                 for (int cx = 0; cx < 32; cx++) {
                     for (int cz = 0; cz < 32; cz++) {
                         int chunkX = (regionX << 5) + cx;
                         int chunkZ = (regionZ << 5) + cz;
                         
-                        // Check if chunk exists by trying to get its data stream
                         try {
                             DataInputStream in = region.getChunkDataInputStream(cx, cz);
                             if (in != null) {
@@ -121,7 +158,6 @@ public class ChunkStorage extends AnvilChunkLoader {
                                 in.close();
                             }
                         } catch (IOException ignored) {
-                            // Chunk doesn't exist
                         }
                     }
                 }
@@ -156,7 +192,13 @@ public class ChunkStorage extends AnvilChunkLoader {
                 return null;
             }
             
-            NBTTagCompound fixed = Minecraft.getMinecraft().getDataFixer().process(FixTypes.CHUNK, nbt);
+            // CRITICAL: Synchronize data fixer access to prevent concurrent modification
+            // Forge's ModFixs uses a HashMap that's not thread-safe
+            NBTTagCompound fixed;
+            synchronized (dataFixerLock) {
+                fixed = Minecraft.getMinecraft().getDataFixer().process(FixTypes.CHUNK, nbt);
+            }
+            
             Bobby.LOGGER.debug("Successfully loaded and fixed chunk {}", pos);
             return fixed;
         } catch (Exception e) {
@@ -168,37 +210,66 @@ public class ChunkStorage extends AnvilChunkLoader {
     @Nullable
     public Chunk deserialize(ChunkPos pos, NBTTagCompound nbt, WorldClient world) {
         try {
-            Bobby.LOGGER.debug("Deserializing chunk {}", pos);
+            Bobby.LOGGER.debug("Deserializing chunk {} using universal method", pos);
             
             if (nbt == null) {
                 Bobby.LOGGER.warn("Cannot deserialize null NBT for chunk {}", pos);
                 return null;
             }
             
-            Object[] data = checkedReadChunkFromNBT__Async(world, pos.x, pos.z, nbt);
-            if (data == null) {
-                Bobby.LOGGER.warn("checkedReadChunkFromNBT returned null for chunk {}", pos);
-                return null;
-            }
+            Chunk chunk = null;
             
-            Chunk chunk = (Chunk) data[0];
-            NBTTagCompound levelTag = (NBTTagCompound) data[1];
-            
-            if (chunk == null) {
-                Bobby.LOGGER.warn("Chunk object is null after deserialization for {}", pos);
-                return null;
-            }
-            
-            if (levelTag != null && levelTag.hasKey("Level")) {
+            // Try reflection-based universal deserialization first
+            if (readChunkFromNBTMethod != null && !reflectionFailed) {
                 try {
-                    loadEntities(world, levelTag.getCompoundTag("Level"), chunk);
+                    // Extract the Level tag which contains the chunk data
+                    NBTTagCompound levelTag = nbt.getCompoundTag("Level");
+                    if (levelTag != null && !levelTag.isEmpty()) {
+                        // Call the low-level readChunkFromNBT method directly
+                        chunk = (Chunk) readChunkFromNBTMethod.invoke(this, world, levelTag);
+                        
+                        if (chunk != null) {
+                            Bobby.LOGGER.debug("Successfully deserialized chunk {} using reflection", pos);
+                            return chunk;
+                        }
+                    }
                 } catch (Exception e) {
-                    Bobby.LOGGER.debug("Failed to load entities for chunk {}, continuing anyway", pos, e);
+                    Bobby.LOGGER.debug("Reflection-based deserialization failed for chunk {}, trying fallback", pos, e);
+                    chunk = null;
+                }
+            }
+            
+            // Fallback: Use the standard async method
+            if (chunk == null) {
+                Bobby.LOGGER.debug("Using standard deserialization for chunk {}", pos);
+                Object[] data = checkedReadChunkFromNBT__Async(world, pos.x, pos.z, nbt);
+                
+                if (data == null) {
+                    Bobby.LOGGER.warn("checkedReadChunkFromNBT returned null for chunk {}", pos);
+                    return null;
+                }
+                
+                chunk = (Chunk) data[0];
+                NBTTagCompound levelTag = (NBTTagCompound) data[1];
+                
+                if (chunk == null) {
+                    Bobby.LOGGER.warn("Chunk object is null after deserialization for {}", pos);
+                    return null;
+                }
+                
+                // Try to load entities, but don't fail if it doesn't work
+                if (levelTag != null && levelTag.hasKey("Level")) {
+                    try {
+                        loadEntities(world, levelTag.getCompoundTag("Level"), chunk);
+                    } catch (Exception e) {
+                        Bobby.LOGGER.debug("Failed to load entities for chunk {}, continuing anyway", pos, e);
+                    }
                 }
             }
             
             Bobby.LOGGER.debug("Successfully deserialized chunk {}", pos);
             return chunk;
+            
         } catch (Exception e) {
             Bobby.LOGGER.error("Failed to deserialize chunk {}", pos, e);
             return null;
@@ -238,7 +309,6 @@ public class ChunkStorage extends AnvilChunkLoader {
 
     /**
      * Process pending saves in batches
-     * FIXED: Now writes directly to Bobby's region files
      */
     public void save() {
         if (pending.isEmpty()) return;
@@ -256,7 +326,6 @@ public class ChunkStorage extends AnvilChunkLoader {
             int z = (int) (packed >> 32);
             
             try {
-                // Write directly to Bobby's region file
                 RegionFile region = getRegionFile(x, z);
                 DataOutputStream out = region.getChunkDataOutputStream(x & 31, z & 31);
                 
@@ -276,7 +345,6 @@ public class ChunkStorage extends AnvilChunkLoader {
             }
         }
         
-        // Remove processed chunks
         for (Long key : toRemove) {
             pending.remove(key);
         }
@@ -306,7 +374,6 @@ public class ChunkStorage extends AnvilChunkLoader {
             }
         }
         
-        // Close all region files to ensure data is written
         closeAllRegions();
         
         if (!pending.isEmpty()) {
@@ -316,9 +383,6 @@ public class ChunkStorage extends AnvilChunkLoader {
         }
     }
     
-    /**
-     * Get the number of pending saves
-     */
     public int getPendingCount() {
         return pending.size();
     }
