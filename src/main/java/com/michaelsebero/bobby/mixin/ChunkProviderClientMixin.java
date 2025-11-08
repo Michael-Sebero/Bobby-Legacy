@@ -1,107 +1,142 @@
 package com.michaelsebero.bobby.mixin;
 
+import com.michaelsebero.bobby.Bobby;
 import com.michaelsebero.bobby.BobbyConfig;
-import com.michaelsebero.bobby.FakeChunkManager;
-import com.michaelsebero.bobby.FakeChunkStorage;
+import com.michaelsebero.bobby.ChunkManager;
+import com.michaelsebero.bobby.ChunkStorage;
 import com.michaelsebero.bobby.ext.IChunkProviderClient;
+import net.minecraft.client.Minecraft;
 import net.minecraft.client.multiplayer.ChunkProviderClient;
 import net.minecraft.client.multiplayer.WorldClient;
-import net.minecraft.nbt.NBTTagCompound;
 import net.minecraft.world.World;
 import net.minecraft.world.chunk.Chunk;
-import org.spongepowered.asm.mixin.Final;
-import org.spongepowered.asm.mixin.Mixin;
-import org.spongepowered.asm.mixin.Shadow;
-import org.spongepowered.asm.mixin.injection.At;
-import org.spongepowered.asm.mixin.injection.Inject;
-import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
-import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
+import org.spongepowered.asm.mixin.*;
+import org.spongepowered.asm.mixin.injection.*;
+import org.spongepowered.asm.mixin.injection.callback.*;
 
 import javax.annotation.Nullable;
+import java.io.File;
 
 @Mixin(ChunkProviderClient.class)
-public abstract class ChunkProviderClientMixin implements IChunkProviderClient {
-    @Shadow public abstract Chunk getLoadedChunk(int x, int z);
+public class ChunkProviderClientMixin implements IChunkProviderClient {
     @Shadow @Final private Chunk blankChunk;
     @Shadow @Final private World world;
+    
     @Nullable
-    protected FakeChunkManager bobbyChunkManager = null;
-    protected @Nullable NBTTagCompound bobbyChunkReplacement;
+    private ChunkManager bobby$manager;
 
     @Inject(method = "<init>", at = @At("RETURN"))
-    private void bobbyInit(World worldIn, CallbackInfo ci) {
-        if(BobbyConfig.enabled)
-            bobbyChunkManager = new FakeChunkManager((WorldClient)worldIn, (ChunkProviderClient) (Object) this);
+    private void onInit(World world, CallbackInfo ci) {
+        if (!BobbyConfig.enabled) return;
+        
+        try {
+            String worldName = getWorldName();
+            int dimension = world.provider.getDimension();
+            
+            File bobbyDir = Minecraft.getMinecraft().gameDir.toPath()
+                .resolve(".bobby")
+                .resolve(worldName)
+                .resolve(String.valueOf(dimension))
+                .toFile();
+            
+            Bobby.LOGGER.info("Bobby storage path: {}", bobbyDir.getAbsolutePath());
+            Bobby.LOGGER.info("World name: '{}', Dimension: {}", worldName, dimension);
+            
+            // Ensure directory exists
+            if (!bobbyDir.exists()) {
+                Bobby.LOGGER.info("Creating Bobby storage directory...");
+                boolean created = bobbyDir.mkdirs();
+                Bobby.LOGGER.info("Directory creation {}", created ? "successful" : "failed");
+            } else {
+                Bobby.LOGGER.info("Bobby storage directory exists: {}", bobbyDir.exists());
+                Bobby.LOGGER.info("Directory contents: {} files", 
+                    bobbyDir.listFiles() != null ? bobbyDir.listFiles().length : 0);
+            }
+            
+            ChunkStorage storage = ChunkStorage.create(bobbyDir);
+            bobby$manager = new ChunkManager((WorldClient) world, storage);
+        } catch (Exception e) {
+            Bobby.LOGGER.error("Failed to initialize ChunkManager", e);
+        }
     }
 
-    @Nullable
     @Override
-    public FakeChunkManager getBobbyChunkManager() {
-        return bobbyChunkManager;
+    public ChunkManager getBobbyChunkManager() {
+        return bobby$manager;
     }
 
     @Inject(method = "provideChunk", at = @At("RETURN"), cancellable = true)
-    private void bobbyGetChunk(int x, int z, CallbackInfoReturnable<Chunk> ci) {
-        if (ci.getReturnValue() != blankChunk) {
-            return;
-        }
-
-        if (bobbyChunkManager == null) {
-            return;
-        }
-
-        Chunk chunk = bobbyChunkManager.getChunk(x, z);
-        if (chunk != null) {
-            ci.setReturnValue(chunk);
+    private void onProvideChunk(int x, int z, CallbackInfoReturnable<Chunk> cir) {
+        if (cir.getReturnValue() == blankChunk && bobby$manager != null) {
+            Chunk fake = bobby$manager.get(x, z);
+            if (fake != null) {
+                cir.setReturnValue(fake);
+            }
         }
     }
 
-    @Inject(method = "loadChunk", at = @At("HEAD"))
-    private void bobbyUnloadFakeChunk(int x, int z, CallbackInfoReturnable<Chunk> cir) {
-        if (bobbyChunkManager == null) {
-            return;
+    @Inject(method = "loadChunk", at = @At("RETURN"))
+    private void onLoadChunk(int x, int z, CallbackInfoReturnable<Chunk> cir) {
+        if (bobby$manager != null && cir.getReturnValue() != null) {
+            bobby$manager.load(x, z, cir.getReturnValue());
         }
-
-        bobbyChunkManager.unload(x, z, true);
     }
 
     @Inject(method = "unloadChunk", at = @At("HEAD"))
-    private void bobbySaveChunk(int chunkX, int chunkZ, CallbackInfo ci) {
-        if (bobbyChunkManager == null) {
-            return;
+    private void onUnloadChunk(int x, int z, CallbackInfo ci) {
+        if (bobby$manager != null) {
+            bobby$manager.unload(x, z);
         }
-
-        Chunk chunk = world.getChunkProvider().getLoadedChunk(chunkX, chunkZ);
-        if (chunk == null) {
-            return;
-        }
-
-        FakeChunkStorage storage = bobbyChunkManager.getStorage();
-        NBTTagCompound tag = storage.serialize(chunk);
-        storage.save(chunk.getPos(), tag);
-        bobbyChunkReplacement = tag;
-    }
-
-    @Inject(method = "unloadChunk", at = @At("RETURN"))
-    private void bobbyReplaceChunk(int chunkX, int chunkZ, CallbackInfo ci) {
-        if (bobbyChunkManager == null) {
-            return;
-        }
-
-        NBTTagCompound tag = bobbyChunkReplacement;
-        bobbyChunkReplacement = null;
-        if (tag == null) {
-            return;
-        }
-        bobbyChunkManager.load(chunkX, chunkZ, tag, bobbyChunkManager.getStorage());
     }
 
     @Inject(method = "makeString", at = @At("RETURN"), cancellable = true)
-    private void bobbyDebugString(CallbackInfoReturnable<String> cir) {
-        if (bobbyChunkManager == null) {
-            return;
+    private void onMakeString(CallbackInfoReturnable<String> cir) {
+        if (bobby$manager != null && BobbyConfig.showDebug) {
+            cir.setReturnValue(cir.getReturnValue() + " " + bobby$manager.getDebugInfo());
         }
+    }
 
-        cir.setReturnValue(cir.getReturnValue() + " " + bobbyChunkManager.getDebugString());
+    private String getWorldName() {
+        // For singleplayer
+        if (Minecraft.getMinecraft().getIntegratedServer() != null) {
+            String name = Minecraft.getMinecraft().getIntegratedServer().getWorldName();
+            Bobby.LOGGER.debug("Singleplayer world name: '{}'", name);
+            return sanitizeFileName(name);
+        }
+        
+        // For multiplayer
+        if (Minecraft.getMinecraft().getCurrentServerData() != null) {
+            String serverIP = Minecraft.getMinecraft().getCurrentServerData().serverIP;
+            Bobby.LOGGER.debug("Multiplayer server IP: '{}'", serverIP);
+            return sanitizeFileName(serverIP.replace(':', '_'));
+        }
+        
+        Bobby.LOGGER.warn("Could not determine world name, using 'unknown'");
+        return "unknown";
+    }
+    
+    /**
+     * Sanitize world name to be safe for filesystem
+     */
+    private String sanitizeFileName(String name) {
+        if (name == null || name.isEmpty()) {
+            return "unknown";
+        }
+        
+        // Replace problematic characters with underscores
+        String sanitized = name
+            .replace('/', '_')
+            .replace('\\', '_')
+            .replace(':', '_')
+            .replace('*', '_')
+            .replace('?', '_')
+            .replace('"', '_')
+            .replace('<', '_')
+            .replace('>', '_')
+            .replace('|', '_')
+            .replace(' ', '_'); // Replace spaces too
+        
+        Bobby.LOGGER.debug("Sanitized '{}' to '{}'", name, sanitized);
+        return sanitized;
     }
 }

@@ -1,21 +1,39 @@
 package com.michaelsebero.bobby.mixin;
 
 import com.michaelsebero.bobby.BobbyConfig;
-import net.minecraft.client.settings.GameSettings;
 import net.minecraft.server.integrated.IntegratedServer;
-import org.objectweb.asm.Opcodes;
+import net.minecraft.server.management.PlayerChunkMap;
+import net.minecraft.world.WorldServer;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
-import org.spongepowered.asm.mixin.injection.Redirect;
+import org.spongepowered.asm.mixin.injection.Inject;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
+/**
+ * Enforces simulation distance on the integrated server
+ * Forces the server to only load chunks within simulationDistance
+ * Everything beyond becomes Bobby's fake chunks
+ */
 @Mixin(IntegratedServer.class)
 public class IntegratedServerMixin {
-    @Redirect(method = "tick", at = @At(value = "FIELD", opcode = Opcodes.GETFIELD, target = "Lnet/minecraft/client/settings/GameSettings;renderDistanceChunks:I"))
-    private int getOverrideViewDistance(GameSettings instance) {
-        int overwrite = BobbyConfig.viewDistanceOverwrite;
-        if (overwrite != 0) {
-            return overwrite;
+    
+    @Inject(method = "tick", at = @At("HEAD"))
+    private void enforceSimulationDistance(CallbackInfo ci) {
+        if (!BobbyConfig.enabled) {
+            return;
         }
-        return instance.renderDistanceChunks;
+        
+        IntegratedServer server = (IntegratedServer) (Object) this;
+        
+        // Apply simulation distance to all dimensions
+        for (WorldServer world : server.worlds) {
+            if (world != null) {
+                PlayerChunkMap chunkMap = world.getPlayerChunkMap();
+                if (chunkMap != null) {
+                    // Force server to only load chunks within simulation distance
+                    chunkMap.setPlayerViewRadius(BobbyConfig.simulationDistance);
+                }
+            }
+        }
     }
 }

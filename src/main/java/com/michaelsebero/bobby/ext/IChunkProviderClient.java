@@ -1,7 +1,7 @@
 package com.michaelsebero.bobby.ext;
 
-import com.michaelsebero.bobby.FakeChunkManager;
+import com.michaelsebero.bobby.ChunkManager;
 
 public interface IChunkProviderClient {
-    FakeChunkManager getBobbyChunkManager();
+    ChunkManager getBobbyChunkManager();
 }

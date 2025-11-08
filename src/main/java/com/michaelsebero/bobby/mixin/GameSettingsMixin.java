@@ -2,56 +2,54 @@ package com.michaelsebero.bobby.mixin;
 
 import com.michaelsebero.bobby.BobbyConfig;
 import net.minecraft.client.settings.GameSettings;
-import net.minecraftforge.common.config.ConfigManager;
 import net.minecraftforge.common.config.Config;
-import org.spongepowered.asm.mixin.Mixin;
-import org.spongepowered.asm.mixin.Shadow;
-import org.spongepowered.asm.mixin.injection.At;
-import org.spongepowered.asm.mixin.injection.Inject;
+import net.minecraftforge.common.config.ConfigManager;
+import org.spongepowered.asm.mixin.*;
+import org.spongepowered.asm.mixin.injection.*;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 
+/**
+ * Handles game settings synchronization with Bobby config
+ * Extends render distance slider to support Bobby's extended range
+ */
 @Mixin(GameSettings.class)
 public class GameSettingsMixin {
     @Shadow public int renderDistanceChunks;
     
-    // Sync slider changes to config
     @Inject(method = "setOptionValue", at = @At("RETURN"))
-    private void bobby$syncRenderDistanceToConfig(GameSettings.Options settingsOption, int value, CallbackInfo ci) {
-        if (settingsOption == GameSettings.Options.RENDER_DISTANCE) {
-            // Update the config value to match slider
-            BobbyConfig.maxRenderDistance = renderDistanceChunks;
-            // Sync config to disk
+    private void syncConfig(GameSettings.Options option, int value, CallbackInfo ci) {
+        if (option == GameSettings.Options.RENDER_DISTANCE) {
+            BobbyConfig.renderDistance = renderDistanceChunks;
             ConfigManager.sync("bobby", Config.Type.INSTANCE);
         }
     }
     
-    // On load, use the config value as the starting render distance
     @Inject(method = "loadOptions", at = @At("RETURN"))
-    private void bobby$loadRenderDistanceFromConfig(CallbackInfo ci) {
-        // If config has a valid value, use it
-        if (BobbyConfig.maxRenderDistance >= 2 && BobbyConfig.maxRenderDistance <= 1816) {
-            // Only override if it's different from what was loaded
-            if (renderDistanceChunks != BobbyConfig.maxRenderDistance) {
-                renderDistanceChunks = BobbyConfig.maxRenderDistance;
-            }
-        }
-        
-        // Clamp just in case
-        if (renderDistanceChunks > 1816) {
-            renderDistanceChunks = 1816;
-        }
-        if (renderDistanceChunks < 2) {
-            renderDistanceChunks = 2;
+    private void loadFromConfig(CallbackInfo ci) {
+        if (BobbyConfig.renderDistance >= 2 && BobbyConfig.renderDistance <= 1816) {
+            renderDistanceChunks = BobbyConfig.renderDistance;
         }
     }
     
-    // Before saving, sync config
     @Inject(method = "saveOptions", at = @At("HEAD"))
-    private void bobby$syncConfigBeforeSave(CallbackInfo ci) {
-        // Update config to match current render distance
-        if (renderDistanceChunks >= 2 && renderDistanceChunks <= 1816) {
-            BobbyConfig.maxRenderDistance = renderDistanceChunks;
+    private void syncBeforeSave(CallbackInfo ci) {
+        // Ensure config is synced before saving
+        if (renderDistanceChunks != BobbyConfig.renderDistance) {
+            BobbyConfig.renderDistance = renderDistanceChunks;
             ConfigManager.sync("bobby", Config.Type.INSTANCE);
+        }
+    }
+    
+    @Mixin(GameSettings.Options.class)
+    public static class OptionsMixin {
+        
+        @Inject(method = "getValueMax", at = @At("HEAD"), cancellable = true)
+        private void setMaxRenderDistance(CallbackInfoReturnable<Float> cir) {
+            GameSettings.Options self = (GameSettings.Options) (Object) this;
+            if (self == GameSettings.Options.RENDER_DISTANCE) {
+                cir.setReturnValue(1816.0F);
+            }
         }
     }
 }

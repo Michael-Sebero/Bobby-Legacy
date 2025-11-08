@@ -3,19 +3,17 @@
   "minVersion": "0.8",
   "package": "com.michaelsebero.bobby.mixin",
   "refmap": "mixins.bobby.refmap.json",
-  "plugin": "com.michaelsebero.bobby.compat.CompatibilityMixinPlugin",
   "compatibilityLevel": "JAVA_8",
-  "client": [
-    "AnvilChunkLoaderMixin",
+  "mixins": [
     "AnvilChunkLoaderAccessor",
+    "AnvilChunkLoaderMixin",
     "ChunkProviderClientMixin",
+    "ChunkTickingMixin",
     "GameSettingsMixin",
-    "GameSettings$OptionsMixin",
     "IntegratedServerMixin",
     "MinecraftMixin",
-    "NetHandlerPlayClientMixin"
-  ],
-  "injectors": {
-    "defaultRequire": 1
-  }
+    "NetHandlerPlayClientMixin",
+    "PlayerChunkMapMixin",
+    "WorldClientMixin"
+  ]
 }
