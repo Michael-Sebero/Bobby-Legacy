@@ -41,8 +41,11 @@ public class FakeChunk extends Chunk {
         ExtendedBlockStorage[] src = source.getBlockStorageArray();
         ExtendedBlockStorage[] dst = this.getBlockStorageArray();
         
+        // CRITICAL FIX: Directly copy section references instead of deep copying
+        // This preserves the internal palette and data arrays that the renderer needs
         for (int i = 0; i < Math.min(src.length, dst.length); i++) {
-            if (src[i] != null) {
+            if (src[i] != null && src[i] != Chunk.NULL_BLOCK_STORAGE) {
+                // Direct reference copy - this is safe because fake chunks never modify blocks
                 dst[i] = src[i];
             }
         }
@@ -56,6 +59,10 @@ public class FakeChunk extends Chunk {
         int[] srcHeight = source.getHeightMap();
         int[] dstHeight = this.getHeightMap();
         System.arraycopy(srcHeight, 0, dstHeight, 0, Math.min(srcHeight.length, dstHeight.length));
+        
+        // Mark chunk as populated and lit to prevent renderer from skipping sections
+        this.setTerrainPopulated(true);
+        this.setLightPopulated(true);
         
         // NEVER COPY: Entities, tile entities, scheduled ticks, or any active data
     }
@@ -195,6 +202,16 @@ public class FakeChunk extends Chunk {
     @Override
     public void setTerrainPopulated(boolean terrainPopulated) {
         // Always populated
+    }
+    
+    @Override
+    public boolean isLightPopulated() {
+        return true; // Always has light data
+    }
+    
+    @Override
+    public void setLightPopulated(boolean lightPopulated) {
+        // Always has light data
     }
     
     // ===== VISUAL DATA ONLY =====
