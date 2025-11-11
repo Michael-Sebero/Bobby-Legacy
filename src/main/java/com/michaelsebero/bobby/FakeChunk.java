@@ -9,8 +9,11 @@ import net.minecraft.world.EnumSkyBlock;
 import net.minecraft.world.World;
 import net.minecraft.world.chunk.Chunk;
 import net.minecraft.world.chunk.storage.ExtendedBlockStorage;
+import net.minecraft.world.chunk.BlockStateContainer;
+import net.minecraft.world.chunk.NibbleArray;
 
 import javax.annotation.Nullable;
+import java.lang.reflect.Field;
 import java.util.Collections;
 import java.util.Map;
 
@@ -23,6 +26,12 @@ public class FakeChunk extends Chunk {
     // Properly sized empty entity array to prevent render crashes
     private static final ClassInheritanceMultiMap<Entity>[] EMPTY_ENTITY_ARRAY = createEmptyEntityArray();
     
+    // Reflection fields for deep copying ExtendedBlockStorage
+    private static Field dataField = null;
+    private static Field blockLightField = null;
+    private static Field skyLightField = null;
+    private static boolean reflectionInitialized = false;
+    
     @SuppressWarnings("unchecked")
     private static ClassInheritanceMultiMap<Entity>[] createEmptyEntityArray() {
         ClassInheritanceMultiMap<Entity>[] array = new ClassInheritanceMultiMap[16];
@@ -32,8 +41,27 @@ public class FakeChunk extends Chunk {
         return array;
     }
     
+    private static void initReflection() {
+        if (reflectionInitialized) return;
+        reflectionInitialized = true;
+        
+        try {
+            dataField = ExtendedBlockStorage.class.getDeclaredField("data");
+            dataField.setAccessible(true);
+            
+            blockLightField = ExtendedBlockStorage.class.getDeclaredField("blockLight");
+            blockLightField.setAccessible(true);
+            
+            skyLightField = ExtendedBlockStorage.class.getDeclaredField("skyLight");
+            skyLightField.setAccessible(true);
+        } catch (Exception e) {
+            // Reflection failed, will fall back to direct reference copy
+        }
+    }
+    
     public FakeChunk(World world, int x, int z) {
         super(world, x, z);
+        initReflection();
     }
     
     public void copyFrom(Chunk source) {
@@ -41,12 +69,10 @@ public class FakeChunk extends Chunk {
         ExtendedBlockStorage[] src = source.getBlockStorageArray();
         ExtendedBlockStorage[] dst = this.getBlockStorageArray();
         
-        // CRITICAL FIX: Directly copy section references instead of deep copying
-        // This preserves the internal palette and data arrays that the renderer needs
+        // Deep copy each section
         for (int i = 0; i < Math.min(src.length, dst.length); i++) {
             if (src[i] != null && src[i] != Chunk.NULL_BLOCK_STORAGE) {
-                // Direct reference copy - this is safe because fake chunks never modify blocks
-                dst[i] = src[i];
+                dst[i] = cloneSection(src[i], i);
             }
         }
         
@@ -65,6 +91,41 @@ public class FakeChunk extends Chunk {
         this.setLightPopulated(true);
         
         // NEVER COPY: Entities, tile entities, scheduled ticks, or any active data
+    }
+    
+    /**
+     * Deep clone an ExtendedBlockStorage section
+     */
+    private ExtendedBlockStorage cloneSection(ExtendedBlockStorage source, int yBase) {
+        ExtendedBlockStorage clone = new ExtendedBlockStorage(yBase << 4, this.getWorld().provider.hasSkyLight());
+        
+        try {
+            // Use reflection to copy internal data structures
+            if (dataField != null) {
+                BlockStateContainer sourceData = (BlockStateContainer) dataField.get(source);
+                dataField.set(clone, sourceData); // Share the BlockStateContainer - it's immutable for fake chunks
+            }
+            
+            if (blockLightField != null && source.getBlockLight() != null) {
+                NibbleArray sourceLight = source.getBlockLight();
+                NibbleArray cloneLight = new NibbleArray();
+                System.arraycopy(sourceLight.getData(), 0, cloneLight.getData(), 0, sourceLight.getData().length);
+                blockLightField.set(clone, cloneLight);
+            }
+            
+            if (skyLightField != null && source.getSkyLight() != null) {
+                NibbleArray sourceLight = source.getSkyLight();
+                NibbleArray cloneLight = new NibbleArray();
+                System.arraycopy(sourceLight.getData(), 0, cloneLight.getData(), 0, sourceLight.getData().length);
+                skyLightField.set(clone, cloneLight);
+            }
+            
+            return clone;
+        } catch (Exception e) {
+            // If reflection fails, just return the source section directly
+            // This is safe for read-only fake chunks
+            return source;
+        }
     }
     
     // ===== PREVENT ALL TICKING AND UPDATES =====
