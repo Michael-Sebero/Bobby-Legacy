@@ -24,8 +24,6 @@ public class Bobby {
     public void preinit(FMLPreInitializationEvent event) {
         MinecraftForge.EVENT_BUS.register(this);
         BobbyConfig.validate();
-        LOGGER.info("Bobby initialized - Render Distance: {}, Simulation: {}", 
-            BobbyConfig.renderDistance, BobbyConfig.simulationDistance);
     }
 
     @SubscribeEvent

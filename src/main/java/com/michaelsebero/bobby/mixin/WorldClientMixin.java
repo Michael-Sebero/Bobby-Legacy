@@ -1,6 +1,5 @@
 package com.michaelsebero.bobby.mixin;
 
-import com.michaelsebero.bobby.Bobby;
 import com.michaelsebero.bobby.ChunkManager;
 import com.michaelsebero.bobby.ext.IChunkProviderClient;
 import net.minecraft.client.multiplayer.WorldClient;
@@ -21,13 +20,8 @@ public abstract class WorldClientMixin extends World {
         super(saveHandlerIn, info, providerIn, profilerIn, client);
     }
 
-    /**
-     * Hook into world unload to ensure Bobby saves all chunks
-     */
     @Inject(method = "sendQuittingDisconnectingPacket", at = @At("HEAD"))
     private void onWorldUnload(CallbackInfo ci) {
-        Bobby.LOGGER.info("WorldClient disconnecting, flushing Bobby cache...");
-        
         if (this.getChunkProvider() instanceof IChunkProviderClient) {
             ChunkManager manager = ((IChunkProviderClient) this.getChunkProvider()).getBobbyChunkManager();
             if (manager != null) {

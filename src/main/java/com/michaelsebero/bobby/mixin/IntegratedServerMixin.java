@@ -9,11 +9,6 @@ import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
-/**
- * Enforces simulation distance on the integrated server
- * Forces the server to only load chunks within simulationDistance
- * Everything beyond becomes Bobby's fake chunks
- */
 @Mixin(IntegratedServer.class)
 public class IntegratedServerMixin {
     
@@ -25,12 +20,10 @@ public class IntegratedServerMixin {
         
         IntegratedServer server = (IntegratedServer) (Object) this;
         
-        // Apply simulation distance to all dimensions
         for (WorldServer world : server.worlds) {
             if (world != null) {
                 PlayerChunkMap chunkMap = world.getPlayerChunkMap();
                 if (chunkMap != null) {
-                    // Force server to only load chunks within simulation distance
                     chunkMap.setPlayerViewRadius(BobbyConfig.simulationDistance);
                 }
             }
