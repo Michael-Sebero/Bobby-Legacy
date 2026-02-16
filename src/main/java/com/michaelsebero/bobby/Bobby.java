@@ -19,18 +19,19 @@ public class Bobby {
 
     @Mod.Instance(MOD_ID)
     public static Bobby INSTANCE;
+    
+    // Storage for entity tracking original values
+    public final EntityTrackerStorage entityStorage = new EntityTrackerStorage();
 
     @Mod.EventHandler
     public void preinit(FMLPreInitializationEvent event) {
         MinecraftForge.EVENT_BUS.register(this);
-        BobbyConfig.validate();
     }
 
     @SubscribeEvent
     public void onConfigChanged(ConfigChangedEvent.OnConfigChangedEvent event) {
         if (event.getModID().equals(MOD_ID)) {
             ConfigManager.sync(MOD_ID, Config.Type.INSTANCE);
-            BobbyConfig.validate();
         }
     }
 }

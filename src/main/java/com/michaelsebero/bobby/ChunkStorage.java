@@ -22,12 +22,26 @@ public class ChunkStorage extends AnvilChunkLoader {
     private final ConcurrentHashMap<Long, NBTTagCompound> pending = new ConcurrentHashMap<>();
     private final AtomicInteger saveCounter = new AtomicInteger(0);
     
-    private final Map<String, RegionFile> regionCache = new HashMap<>();
+    // LRU cache for region files with automatic eviction
+    private final Map<String, RegionFile> regionCache = Collections.synchronizedMap(
+        new LinkedHashMap<String, RegionFile>(16, 0.75f, true) {
+            @Override
+            protected boolean removeEldestEntry(Map.Entry<String, RegionFile> eldest) {
+                if (size() > 64) {
+                    try {
+                        eldest.getValue().close();
+                    } catch (IOException e) {
+                        Bobby.LOGGER.debug("Failed to close region file", e);
+                    }
+                    return true;
+                }
+                return false;
+            }
+        }
+    );
     
     private static Method readChunkFromNBTMethod = null;
     private static boolean reflectionFailed = false;
-    
-    private static final Object dataFixerLock = new Object();
     
     public ChunkStorage(File dir) {
         super(dir, Minecraft.getMinecraft().getDataFixer());
@@ -50,19 +64,19 @@ public class ChunkStorage extends AnvilChunkLoader {
                     method.getParameterCount() == 2) {
                     method.setAccessible(true);
                     readChunkFromNBTMethod = method;
-                    break;
+                    Bobby.LOGGER.info("Successfully initialized chunk deserialization reflection");
+                    return;
                 }
             }
-            
-            if (readChunkFromNBTMethod == null) {
-                reflectionFailed = true;
-            }
+            reflectionFailed = true;
+            Bobby.LOGGER.warn("Could not find readChunkFromNBT method via reflection");
         } catch (Exception e) {
             reflectionFailed = true;
+            Bobby.LOGGER.error("Failed to initialize reflection", e);
         }
     }
 
-    private synchronized RegionFile getRegionFile(int chunkX, int chunkZ) throws IOException {
+    private RegionFile getRegionFile(int chunkX, int chunkZ) throws IOException {
         int regionX = chunkX >> 5;
         int regionZ = chunkZ >> 5;
         String key = regionX + "," + regionZ;
@@ -79,19 +93,21 @@ public class ChunkStorage extends AnvilChunkLoader {
         return region;
     }
     
-    private synchronized void closeAllRegions() {
-        for (RegionFile region : regionCache.values()) {
-            try {
-                region.close();
-            } catch (IOException e) {
-                // Silent fail
+    private void closeAllRegions() {
+        synchronized (regionCache) {
+            for (RegionFile region : regionCache.values()) {
+                try {
+                    region.close();
+                } catch (IOException e) {
+                    Bobby.LOGGER.debug("Failed to close region file", e);
+                }
             }
+            regionCache.clear();
         }
-        regionCache.clear();
     }
 
     public Set<ChunkPos> getStoredChunks() {
-        Set<ChunkPos> chunks = new HashSet<>();
+        Set<ChunkPos> chunks = ConcurrentHashMap.newKeySet();
         
         File regionDir = chunkSaveLocation;
         if (!regionDir.exists() || !regionDir.isDirectory()) {
@@ -103,39 +119,53 @@ public class ChunkStorage extends AnvilChunkLoader {
             return chunks;
         }
         
-        for (File regionFile : regionFiles) {
+        // Process region files in parallel for faster discovery
+        Arrays.stream(regionFiles).parallel().forEach(regionFile -> {
+            RegionFile region = null;
             try {
                 String name = regionFile.getName();
                 String[] parts = name.replace(".mca", "").split("\\.");
-                if (parts.length != 3) continue;
+                if (parts.length != 3) return;
                 
                 int regionX = Integer.parseInt(parts[1]);
                 int regionZ = Integer.parseInt(parts[2]);
                 
-                RegionFile region = new RegionFile(regionFile);
+                region = new RegionFile(regionFile);
                 
                 for (int cx = 0; cx < 32; cx++) {
                     for (int cz = 0; cz < 32; cz++) {
-                        int chunkX = (regionX << 5) + cx;
-                        int chunkZ = (regionZ << 5) + cz;
-                        
+                        DataInputStream in = null;
                         try {
-                            DataInputStream in = region.getChunkDataInputStream(cx, cz);
+                            in = region.getChunkDataInputStream(cx, cz);
                             if (in != null) {
+                                int chunkX = (regionX << 5) + cx;
+                                int chunkZ = (regionZ << 5) + cz;
                                 chunks.add(new ChunkPos(chunkX, chunkZ));
                                 in.close();
                             }
-                        } catch (IOException ignored) {
+                        } catch (IOException e) {
+                            Bobby.LOGGER.debug("Failed to read chunk data", e);
+                        } finally {
+                            if (in != null) {
+                                try {
+                                    in.close();
+                                } catch (IOException ignored) {}
+                            }
                         }
                     }
                 }
-                
-                region.close();
-                
             } catch (Exception e) {
-                // Silent fail
+                Bobby.LOGGER.debug("Failed to scan region file: " + regionFile.getName(), e);
+            } finally {
+                if (region != null) {
+                    try {
+                        region.close();
+                    } catch (IOException e) {
+                        Bobby.LOGGER.debug("Failed to close region file", e);
+                    }
+                }
             }
-        }
+        });
         
         return chunks;
     }
@@ -150,81 +180,66 @@ public class ChunkStorage extends AnvilChunkLoader {
                 return null;
             }
             
-            NBTTagCompound nbt = CompressedStreamTools.read(in);
-            in.close();
-            
-            if (nbt == null) {
-                return null;
+            try {
+                NBTTagCompound nbt = CompressedStreamTools.read(in);
+                if (nbt == null) {
+                    return null;
+                }
+                
+                return Minecraft.getMinecraft().getDataFixer().process(FixTypes.CHUNK, nbt);
+            } finally {
+                in.close();
             }
-            
-            NBTTagCompound fixed;
-            synchronized (dataFixerLock) {
-                fixed = Minecraft.getMinecraft().getDataFixer().process(FixTypes.CHUNK, nbt);
-            }
-            
-            return fixed;
         } catch (Exception e) {
+            Bobby.LOGGER.debug("Failed to load chunk at " + pos, e);
             return null;
         }
     }
 
     @Nullable
     public Chunk deserialize(ChunkPos pos, NBTTagCompound nbt, WorldClient world) {
+        if (nbt == null) {
+            return null;
+        }
+        
         try {
-            if (nbt == null) {
+            NBTTagCompound levelTag = nbt.getCompoundTag("Level");
+            if (levelTag == null || levelTag.isEmpty()) {
                 return null;
             }
             
             Chunk chunk = null;
             
+            // Try reflection method first (faster)
             if (readChunkFromNBTMethod != null && !reflectionFailed) {
                 try {
-                    NBTTagCompound levelTag = nbt.getCompoundTag("Level");
-                    if (levelTag != null && !levelTag.isEmpty()) {
-                        chunk = (Chunk) readChunkFromNBTMethod.invoke(this, world, levelTag);
-                        
-                        if (chunk != null) {
-                            try {
-                                loadEntities(world, levelTag, chunk);
-                            } catch (Exception e) {
-                                // Continue anyway
-                            }
-                            
-                            return chunk;
-                        }
-                    }
+                    chunk = (Chunk) readChunkFromNBTMethod.invoke(this, world, levelTag);
                 } catch (Exception e) {
-                    chunk = null;
+                    Bobby.LOGGER.debug("Reflection deserialization failed, using fallback", e);
                 }
             }
             
+            // Fallback to parent class method
             if (chunk == null) {
                 Object[] data = checkedReadChunkFromNBT__Async(world, pos.x, pos.z, nbt);
-                
-                if (data == null) {
-                    return null;
+                if (data != null && data[0] instanceof Chunk) {
+                    chunk = (Chunk) data[0];
                 }
-                
-                chunk = (Chunk) data[0];
-                NBTTagCompound levelTag = (NBTTagCompound) data[1];
-                
-                if (chunk == null) {
-                    return null;
-                }
-                
-                if (levelTag != null && levelTag.hasKey("Level")) {
-                    try {
-                        NBTTagCompound level = levelTag.getCompoundTag("Level");
-                        loadEntities(world, level, chunk);
-                    } catch (Exception e) {
-                        // Continue anyway
-                    }
+            }
+            
+            // Load entities
+            if (chunk != null) {
+                try {
+                    loadEntities(world, levelTag, chunk);
+                } catch (Exception e) {
+                    Bobby.LOGGER.debug("Failed to load entities for chunk at " + pos, e);
                 }
             }
             
             return chunk;
             
         } catch (Exception e) {
+            Bobby.LOGGER.debug("Failed to deserialize chunk at " + pos, e);
             return null;
         }
     }
@@ -237,13 +252,10 @@ public class ChunkStorage extends AnvilChunkLoader {
             root.setTag("Level", level);
             root.setInteger("DataVersion", 1343);
             
-            try {
-                ((AnvilChunkLoaderAccessor) this).invokeWriteChunkToNBT(chunk, chunk.getWorld(), level);
-                return root;
-            } catch (ConcurrentModificationException e) {
-                return null;
-            }
+            ((AnvilChunkLoaderAccessor) this).invokeWriteChunkToNBT(chunk, chunk.getWorld(), level);
+            return root;
         } catch (Exception e) {
+            Bobby.LOGGER.debug("Failed to serialize chunk at " + chunk.getPos(), e);
             return null;
         }
     }
@@ -257,10 +269,9 @@ public class ChunkStorage extends AnvilChunkLoader {
     public void save() {
         if (pending.isEmpty()) return;
         
-        int count = 0;
         int maxPerBatch = Math.min(20, pending.size());
-        
         List<Long> toRemove = new ArrayList<>();
+        int count = 0;
         
         for (Map.Entry<Long, NBTTagCompound> entry : pending.entrySet()) {
             if (count >= maxPerBatch) break;
@@ -274,21 +285,23 @@ public class ChunkStorage extends AnvilChunkLoader {
                 DataOutputStream out = region.getChunkDataOutputStream(x & 31, z & 31);
                 
                 if (out != null) {
-                    CompressedStreamTools.write(entry.getValue(), out);
-                    out.close();
-                    toRemove.add(packed);
-                    count++;
+                    try {
+                        CompressedStreamTools.write(entry.getValue(), out);
+                        toRemove.add(packed);
+                        count++;
+                    } finally {
+                        out.close();
+                    }
                 } else {
                     toRemove.add(packed);
                 }
             } catch (Exception e) {
+                Bobby.LOGGER.debug("Failed to save chunk at " + x + ", " + z, e);
                 toRemove.add(packed);
             }
         }
         
-        for (Long key : toRemove) {
-            pending.remove(key);
-        }
+        toRemove.forEach(pending::remove);
         
         if (count > 0) {
             saveCounter.addAndGet(count);

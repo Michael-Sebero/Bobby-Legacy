@@ -9,17 +9,14 @@ import org.spongepowered.asm.mixin.injection.*;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 
-/**
- * Handles game settings synchronization with Bobby config
- * Extends render distance slider to support Bobby's extended range
- */
 @Mixin(GameSettings.class)
 public class GameSettingsMixin {
     @Shadow public int renderDistanceChunks;
     
     @Inject(method = "setOptionValue", at = @At("RETURN"))
     private void syncConfig(GameSettings.Options option, int value, CallbackInfo ci) {
-        if (option == GameSettings.Options.RENDER_DISTANCE) {
+        if (option == GameSettings.Options.RENDER_DISTANCE && 
+            renderDistanceChunks != BobbyConfig.renderDistance) {
             BobbyConfig.renderDistance = renderDistanceChunks;
             ConfigManager.sync("bobby", Config.Type.INSTANCE);
         }
@@ -29,15 +26,6 @@ public class GameSettingsMixin {
     private void loadFromConfig(CallbackInfo ci) {
         if (BobbyConfig.renderDistance >= 2 && BobbyConfig.renderDistance <= 1816) {
             renderDistanceChunks = BobbyConfig.renderDistance;
-        }
-    }
-    
-    @Inject(method = "saveOptions", at = @At("HEAD"))
-    private void syncBeforeSave(CallbackInfo ci) {
-        // Ensure config is synced before saving
-        if (renderDistanceChunks != BobbyConfig.renderDistance) {
-            BobbyConfig.renderDistance = renderDistanceChunks;
-            ConfigManager.sync("bobby", Config.Type.INSTANCE);
         }
     }
     

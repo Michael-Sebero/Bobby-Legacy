@@ -10,7 +10,8 @@ public class BobbyConfig {
     
     @Config.Comment({
         "Maximum render distance in chunks (2-1816)",
-        "Synced with Video Settings slider"
+        "Synced with Video Settings slider",
+        "Also controls entity render distance"
     })
     @Config.RangeInt(min = 2, max = 1816)
     public static int renderDistance = 33;
@@ -21,6 +22,8 @@ public class BobbyConfig {
         "In multiplayer: Chunks beyond server's distance become fake chunks",
         "Real chunks (0 to simulationDistance): Full ticking, entities, updates",
         "Fake chunks (simulationDistance to renderDistance): Visual only, frozen",
+        "Entities within simulationDistance: Full ticking and movement",
+        "Entities beyond simulationDistance: Visible but frozen (no ticking)",
         "Requires world reload to take effect in singleplayer"
     })
     @Config.RangeInt(min = 2, max = 32)
@@ -47,8 +50,11 @@ public class BobbyConfig {
     @Config.Comment("Show debug info in F3 screen")
     public static boolean showDebug = true;
     
-    public static void validate() {
-        renderDistance = Math.max(2, Math.min(renderDistance, 1816));
-        simulationDistance = Math.max(2, Math.min(simulationDistance, renderDistance));
-    }
+    @Config.Comment({
+        "Freeze entities beyond simulation distance",
+        "When enabled, entities outside simulationDistance won't tick/move",
+        "They will still be visible up to renderDistance but won't update",
+        "Improves performance in singleplayer with large render distances"
+    })
+    public static boolean freezeDistantEntities = true;
 }

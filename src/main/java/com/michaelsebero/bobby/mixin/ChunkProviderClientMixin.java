@@ -39,14 +39,16 @@ public class ChunkProviderClientMixin implements IChunkProviderClient {
                 .resolve(String.valueOf(dimension))
                 .toFile();
             
-            if (!bobbyDir.exists()) {
-                bobbyDir.mkdirs();
+            if (!bobbyDir.exists() && !bobbyDir.mkdirs()) {
+                Bobby.LOGGER.error("Failed to create Bobby directory: " + bobbyDir);
+                return;
             }
             
             ChunkStorage storage = ChunkStorage.create(bobbyDir);
             bobby$manager = new ChunkManager((WorldClient) world, storage);
+            Bobby.LOGGER.info("Bobby initialized for " + worldName + " (dimension " + dimension + ")");
         } catch (Exception e) {
-            // Silent fail
+            Bobby.LOGGER.error("Failed to initialize Bobby", e);
         }
     }
 
@@ -105,16 +107,6 @@ public class ChunkProviderClientMixin implements IChunkProviderClient {
             return "unknown";
         }
         
-        return name
-            .replace('/', '_')
-            .replace('\\', '_')
-            .replace(':', '_')
-            .replace('*', '_')
-            .replace('?', '_')
-            .replace('"', '_')
-            .replace('<', '_')
-            .replace('>', '_')
-            .replace('|', '_')
-            .replace(' ', '_');
+        return name.replaceAll("[/\\\\:*?\"<>| ]", "_");
     }
 }
