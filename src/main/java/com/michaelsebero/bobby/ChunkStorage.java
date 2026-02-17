@@ -21,33 +21,40 @@ import java.util.concurrent.atomic.AtomicInteger;
 public class ChunkStorage extends AnvilChunkLoader {
     private final ConcurrentHashMap<Long, NBTTagCompound> pending = new ConcurrentHashMap<>();
     private final AtomicInteger saveCounter = new AtomicInteger(0);
-    
-    // LRU cache for region files with automatic eviction
-    private final Map<String, RegionFile> regionCache = Collections.synchronizedMap(
-        new LinkedHashMap<String, RegionFile>(16, 0.75f, true) {
-            @Override
-            protected boolean removeEldestEntry(Map.Entry<String, RegionFile> eldest) {
-                if (size() > 64) {
-                    try {
-                        eldest.getValue().close();
-                    } catch (IOException e) {
-                        Bobby.LOGGER.debug("Failed to close region file", e);
-                    }
-                    return true;
+
+    /**
+     * FIX: regionCache is wrapped with Collections.synchronizedMap, which only synchronizes
+     * *individual* method calls, not compound operations. The previous getRegionFile had a
+     * classic check-then-act race: two executor threads could both call get() and see null,
+     * then both open the same RegionFile and put conflicting instances into the map, leading
+     * to corruption and resource leaks.
+     *
+     * All access to regionCache now goes through synchronized blocks on the map itself,
+     * making the get-check-create-put sequence atomic.
+     */
+    private final Map<String, RegionFile> regionCache = new LinkedHashMap<String, RegionFile>(16, 0.75f, true) {
+        @Override
+        protected boolean removeEldestEntry(Map.Entry<String, RegionFile> eldest) {
+            if (size() > 64) {
+                try {
+                    eldest.getValue().close();
+                } catch (IOException e) {
+                    Bobby.LOGGER.debug("Failed to close region file", e);
                 }
-                return false;
+                return true;
             }
+            return false;
         }
-    );
-    
+    };
+
     private static Method readChunkFromNBTMethod = null;
     private static boolean reflectionFailed = false;
-    
+
     public ChunkStorage(File dir) {
         super(dir, Minecraft.getMinecraft().getDataFixer());
         initializeReflection();
     }
-    
+
     public static ChunkStorage create(File dir) {
         dir.mkdirs();
         return new ChunkStorage(dir);
@@ -57,10 +64,10 @@ public class ChunkStorage extends AnvilChunkLoader {
         if (readChunkFromNBTMethod != null || reflectionFailed) {
             return;
         }
-        
+
         try {
             for (Method method : AnvilChunkLoader.class.getDeclaredMethods()) {
-                if (method.getReturnType() == Chunk.class && 
+                if (method.getReturnType() == Chunk.class &&
                     method.getParameterCount() == 2) {
                     method.setAccessible(true);
                     readChunkFromNBTMethod = method;
@@ -80,19 +87,22 @@ public class ChunkStorage extends AnvilChunkLoader {
         int regionX = chunkX >> 5;
         int regionZ = chunkZ >> 5;
         String key = regionX + "," + regionZ;
-        
-        RegionFile region = regionCache.get(key);
-        if (region != null) {
+
+        // Synchronize the entire compound operation to prevent two threads from
+        // simultaneously finding no entry and both opening the same RegionFile.
+        synchronized (regionCache) {
+            RegionFile region = regionCache.get(key);
+            if (region != null) {
+                return region;
+            }
+
+            File regionFile = new File(chunkSaveLocation, "r." + regionX + "." + regionZ + ".mca");
+            region = new RegionFile(regionFile);
+            regionCache.put(key, region);
             return region;
         }
-        
-        File regionFile = new File(chunkSaveLocation, "r." + regionX + "." + regionZ + ".mca");
-        region = new RegionFile(regionFile);
-        regionCache.put(key, region);
-        
-        return region;
     }
-    
+
     private void closeAllRegions() {
         synchronized (regionCache) {
             for (RegionFile region : regionCache.values()) {
@@ -108,30 +118,29 @@ public class ChunkStorage extends AnvilChunkLoader {
 
     public Set<ChunkPos> getStoredChunks() {
         Set<ChunkPos> chunks = ConcurrentHashMap.newKeySet();
-        
+
         File regionDir = chunkSaveLocation;
         if (!regionDir.exists() || !regionDir.isDirectory()) {
             return chunks;
         }
-        
+
         File[] regionFiles = regionDir.listFiles((dir, name) -> name.endsWith(".mca"));
         if (regionFiles == null || regionFiles.length == 0) {
             return chunks;
         }
-        
-        // Process region files in parallel for faster discovery
+
         Arrays.stream(regionFiles).parallel().forEach(regionFile -> {
             RegionFile region = null;
             try {
                 String name = regionFile.getName();
                 String[] parts = name.replace(".mca", "").split("\\.");
                 if (parts.length != 3) return;
-                
+
                 int regionX = Integer.parseInt(parts[1]);
                 int regionZ = Integer.parseInt(parts[2]);
-                
+
                 region = new RegionFile(regionFile);
-                
+
                 for (int cx = 0; cx < 32; cx++) {
                     for (int cz = 0; cz < 32; cz++) {
                         DataInputStream in = null;
@@ -147,9 +156,7 @@ public class ChunkStorage extends AnvilChunkLoader {
                             Bobby.LOGGER.debug("Failed to read chunk data", e);
                         } finally {
                             if (in != null) {
-                                try {
-                                    in.close();
-                                } catch (IOException ignored) {}
+                                try { in.close(); } catch (IOException ignored) {}
                             }
                         }
                     }
@@ -158,15 +165,13 @@ public class ChunkStorage extends AnvilChunkLoader {
                 Bobby.LOGGER.debug("Failed to scan region file: " + regionFile.getName(), e);
             } finally {
                 if (region != null) {
-                    try {
-                        region.close();
-                    } catch (IOException e) {
+                    try { region.close(); } catch (IOException e) {
                         Bobby.LOGGER.debug("Failed to close region file", e);
                     }
                 }
             }
         });
-        
+
         return chunks;
     }
 
@@ -174,18 +179,20 @@ public class ChunkStorage extends AnvilChunkLoader {
     public NBTTagCompound load(ChunkPos pos) {
         try {
             RegionFile region = getRegionFile(pos.x, pos.z);
-            DataInputStream in = region.getChunkDataInputStream(pos.x & 31, pos.z & 31);
-            
+            DataInputStream in;
+            synchronized (regionCache) {
+                in = region.getChunkDataInputStream(pos.x & 31, pos.z & 31);
+            }
+
             if (in == null) {
                 return null;
             }
-            
+
             try {
                 NBTTagCompound nbt = CompressedStreamTools.read(in);
                 if (nbt == null) {
                     return null;
                 }
-                
                 return Minecraft.getMinecraft().getDataFixer().process(FixTypes.CHUNK, nbt);
             } finally {
                 in.close();
@@ -201,16 +208,15 @@ public class ChunkStorage extends AnvilChunkLoader {
         if (nbt == null) {
             return null;
         }
-        
+
         try {
             NBTTagCompound levelTag = nbt.getCompoundTag("Level");
             if (levelTag == null || levelTag.isEmpty()) {
                 return null;
             }
-            
+
             Chunk chunk = null;
-            
-            // Try reflection method first (faster)
+
             if (readChunkFromNBTMethod != null && !reflectionFailed) {
                 try {
                     chunk = (Chunk) readChunkFromNBTMethod.invoke(this, world, levelTag);
@@ -218,16 +224,14 @@ public class ChunkStorage extends AnvilChunkLoader {
                     Bobby.LOGGER.debug("Reflection deserialization failed, using fallback", e);
                 }
             }
-            
-            // Fallback to parent class method
+
             if (chunk == null) {
                 Object[] data = checkedReadChunkFromNBT__Async(world, pos.x, pos.z, nbt);
                 if (data != null && data[0] instanceof Chunk) {
                     chunk = (Chunk) data[0];
                 }
             }
-            
-            // Load entities
+
             if (chunk != null) {
                 try {
                     loadEntities(world, levelTag, chunk);
@@ -235,9 +239,9 @@ public class ChunkStorage extends AnvilChunkLoader {
                     Bobby.LOGGER.debug("Failed to load entities for chunk at " + pos, e);
                 }
             }
-            
+
             return chunk;
-            
+
         } catch (Exception e) {
             Bobby.LOGGER.debug("Failed to deserialize chunk at " + pos, e);
             return null;
@@ -251,7 +255,7 @@ public class ChunkStorage extends AnvilChunkLoader {
             NBTTagCompound level = new NBTTagCompound();
             root.setTag("Level", level);
             root.setInteger("DataVersion", 1343);
-            
+
             ((AnvilChunkLoaderAccessor) this).invokeWriteChunkToNBT(chunk, chunk.getWorld(), level);
             return root;
         } catch (Exception e) {
@@ -268,22 +272,25 @@ public class ChunkStorage extends AnvilChunkLoader {
 
     public void save() {
         if (pending.isEmpty()) return;
-        
+
         int maxPerBatch = Math.min(20, pending.size());
         List<Long> toRemove = new ArrayList<>();
         int count = 0;
-        
+
         for (Map.Entry<Long, NBTTagCompound> entry : pending.entrySet()) {
             if (count >= maxPerBatch) break;
-            
+
             long packed = entry.getKey();
             int x = (int) packed;
             int z = (int) (packed >> 32);
-            
+
             try {
                 RegionFile region = getRegionFile(x, z);
-                DataOutputStream out = region.getChunkDataOutputStream(x & 31, z & 31);
-                
+                DataOutputStream out;
+                synchronized (regionCache) {
+                    out = region.getChunkDataOutputStream(x & 31, z & 31);
+                }
+
                 if (out != null) {
                     try {
                         CompressedStreamTools.write(entry.getValue(), out);
@@ -300,25 +307,25 @@ public class ChunkStorage extends AnvilChunkLoader {
                 toRemove.add(packed);
             }
         }
-        
+
         toRemove.forEach(pending::remove);
-        
+
         if (count > 0) {
             saveCounter.addAndGet(count);
         }
     }
 
+    /**
+     * FIX (Bug 5): Loop until truly empty rather than bounding by iteration count.
+     * save() always removes entries (even failed ones), so the loop must terminate.
+     */
     public void flush() {
-        int flushed = 0;
-        
-        while (!pending.isEmpty() && flushed < 1000) {
+        while (!pending.isEmpty()) {
             save();
-            flushed++;
         }
-        
         closeAllRegions();
     }
-    
+
     public int getPendingCount() {
         return pending.size();
     }

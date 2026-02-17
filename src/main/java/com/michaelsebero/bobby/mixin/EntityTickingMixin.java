@@ -13,13 +13,12 @@ import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
 /**
- * Prevents entities beyond simulation distance from ticking
- * Entities between simulationDistance and renderDistance are visible but frozen
- * This mirrors the behavior of fake chunks - visual only, no updates
+ * Prevents entities beyond simulation distance from ticking.
+ * Entities between simulationDistance and renderDistance are visible but frozen.
  */
 @Mixin(Entity.class)
 public abstract class EntityTickingMixin {
-    
+
     @Shadow public World world;
     @Shadow public double posX;
     @Shadow public double posY;
@@ -29,51 +28,53 @@ public abstract class EntityTickingMixin {
     @Shadow public float prevRotationYaw;
     @Shadow public float prevRotationPitch;
     @Shadow public int ticksExisted;
-    
+
     @Inject(method = "onUpdate", at = @At("HEAD"), cancellable = true)
     private void freezeDistantEntities(CallbackInfo ci) {
         if (!BobbyConfig.enabled || !BobbyConfig.freezeDistantEntities) {
             return;
         }
-        
+
         Entity self = (Entity) (Object) this;
-        
-        // Players should always update
+
         if (self instanceof EntityPlayer) {
             return;
         }
-        
-        // Only freeze entities that have existed for at least 1 tick
-        // This allows newly spawned entities to initialize properly
+
         if (ticksExisted < 1) {
             return;
         }
-        
+
         // Only apply to integrated server (singleplayer)
         IntegratedServer server = Minecraft.getMinecraft().getIntegratedServer();
         if (server == null) {
             return;
         }
-        
-        // Find nearest player
+
         EntityPlayer nearestPlayer = world.getClosestPlayerToEntity(self, -1.0);
         if (nearestPlayer == null) {
             return;
         }
-        
-        // Calculate distance in chunks
+
         double dx = posX - nearestPlayer.posX;
         double dz = posZ - nearestPlayer.posZ;
-        double distanceChunks = Math.sqrt(dx * dx + dz * dz) / 16.0;
-        
-        // If beyond simulation distance, freeze the entity
-        if (distanceChunks > BobbyConfig.simulationDistance) {
-            // Freeze rotation by syncing current rotation to previous rotation
-            // This prevents interpolation/spinning on client
+
+        /**
+         * FIX (Bug 7): Original computed Math.sqrt(dx*dx + dz*dz) / 16.0 and compared to
+         * simulationDistance. sqrt() is expensive when called for every non-player entity
+         * every tick. Compare squared distances instead — equivalent math, zero sqrt cost.
+         *
+         * (dist/16 > simDist)  ≡  dist² > (simDist * 16)²
+         */
+        double simDistBlocks = BobbyConfig.simulationDistance * 16.0;
+        double distanceSq = dx * dx + dz * dz;
+
+        if (distanceSq > simDistBlocks * simDistBlocks) {
+            // Freeze rotation to prevent visual interpolation/spinning while frozen
             prevRotationYaw = rotationYaw;
             prevRotationPitch = rotationPitch;
-            
-            ci.cancel(); // Don't update this entity - it's frozen
+
+            ci.cancel();
         }
     }
 }
