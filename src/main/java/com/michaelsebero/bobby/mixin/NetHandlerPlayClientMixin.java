@@ -1,5 +1,6 @@
 package com.michaelsebero.bobby.mixin;
 
+import com.michaelsebero.bobby.Bobby;
 import com.michaelsebero.bobby.ChunkManager;
 import com.michaelsebero.bobby.ext.IChunkProviderClient;
 import net.minecraft.client.multiplayer.WorldClient;
@@ -39,7 +40,15 @@ public class NetHandlerPlayClientMixin {
                 manager.load(x, z, chunk);
             }
         } catch (Exception e) {
-            // Silent fail
+            /**
+             * FIX: this used to be a bare "// Silent fail" comment with no logging
+             * at all - the only place in the codebase that swallowed an exception
+             * without even a debug-level log line. Every other catch block here logs
+             * at minimum Bobby.LOGGER.debug(...), which costs nothing at the default
+             * log level but means a real problem isn't invisible if this ever needs
+             * diagnosing.
+             */
+            Bobby.LOGGER.debug("Failed to cache chunk data for chunk (" + data.getChunkX() + ", " + data.getChunkZ() + ")", e);
         }
     }
 }

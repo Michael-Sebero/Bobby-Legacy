@@ -22,7 +22,9 @@ pluginManagement {
 }
 
 plugins {
-    id 'org.gradle.toolchains.foojay-resolver-convention' version '0.7.0'
+    // 0.7.0 references JvmVendorSpec.IBM_SEMERU, which Gradle 9.0 deleted -> bumped to
+    // 1.0.0, the first release built against Gradle 9's toolchain APIs
+    id 'org.gradle.toolchains.foojay-resolver-convention' version '1.0.0'
 }
 
 rootProject.name = 'bobby'

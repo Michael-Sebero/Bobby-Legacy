@@ -7,9 +7,7 @@
   "mixins": [
     "AnvilChunkLoaderAccessor",
     "ChunkProviderClientMixin",
-    "ChunkTickingMixin",
     "EntityRenderDistanceMixin",
-    "EntityTickingMixin",
     "EntityTrackerEntryMixin",
     "GameSettingsMixin",
     "IntegratedServerMixin",

@@ -33,7 +33,7 @@ public class ChunkManager {
         }
     );
 
-    private final ConcurrentHashMap<Long, CompletableFuture<?>> loading = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<Long, AtomicBoolean> loading = new ConcurrentHashMap<>();
     private final Queue<ChunkPos> loadQueue = new ConcurrentLinkedQueue<>();
     private final Queue<ChunkPos> unloadQueue = new ConcurrentLinkedQueue<>();
     private final Set<ChunkPos> pendingRenderUpdates = ConcurrentHashMap.newKeySet();
@@ -315,28 +315,60 @@ public class ChunkManager {
         long pos = ChunkPos.asLong(x, z);
 
         /**
-         * FIX: The original code created the CompletableFuture first, then called
-         * loading.put(pos, future) at the end. Since the future is already executing
-         * as soon as supplyAsync() is called, it can complete and its whenComplete
-         * handler can call loading.remove(pos) BEFORE loading.put(pos, future) runs.
-         * This leaves a completed future permanently in the loading map, blocking any
-         * future load attempts for that chunk position.
+         * FIX (getLoadedChunk() called off the main thread): this used to check
+         * world.getChunkProvider().getLoadedChunk(x, z) from inside the supplyAsync
+         * block below, i.e. on a background executor thread. ChunkProviderClient's
+         * internal chunk storage is only ever meant to be touched from the main
+         * thread - vanilla mutates it there via provideChunk/loadChunk/unloadChunk
+         * with no synchronization of its own, so reading it concurrently from a
+         * worker thread is a data race (best case: a stale answer; worst case
+         * depends on exactly what that storage is backed by internally, which isn't
+         * something worth gambling on).
          *
-         * Fix: Register a placeholder CompletableFuture in loading BEFORE submitting
-         * any work to the executor. The placeholder is completed by whenComplete once
-         * the task finishes, keeping loading.remove() consistent.
+         * Fix: only ever call getLoadedChunk() from the main thread. Checked here,
+         * synchronously, before any work is dispatched (loadAsync() is only ever
+         * called from the main thread, so this is safe) as a cheap early-out, and
+         * checked again just before the FakeChunk is actually published (see the
+         * addScheduledTask block below) since that's both safe and the freshest
+         * possible point to ask the question.
          */
-        CompletableFuture<Void> placeholder = new CompletableFuture<>();
+        if (world.getChunkProvider().getLoadedChunk(x, z) != null) {
+            return;
+        }
+
+        /**
+         * FIX (unload() cancellation was a no-op): the previous version put a bare
+         * placeholder CompletableFuture in `loading` (to fix an earlier put/remove
+         * ordering race - see below) and had unload() call .cancel(true) on it. That
+         * placeholder was never actually linked to the real supplyAsync(...) chain
+         * doing the work below - the only connection was whenComplete() manually
+         * completing it at the end. Cancelling it did nothing: the real background
+         * load kept running and could still fakeChunks.put(...) a chunk back in
+         * shortly after unload() had already evicted it.
+         *
+         * Fix: loading now stores a single shared AtomicBoolean "cancelled" flag
+         * instead of a disconnected future. unload()/shutdown() flip the same flag
+         * this task checks - once at the start (skip entirely if already cancelled,
+         * saving the disk read/deserialize), and again right before publishing to
+         * fakeChunks (the check that actually matters: it guarantees a position that's
+         * been evicted can never be resurrected by a load that was already in flight,
+         * no matter how the two race).
+         *
+         * The original ordering fix is preserved: the flag is registered in `loading`
+         * before any work is submitted to the executor, so there's still no window
+         * where a fast-completing task could find its own entry missing.
+         */
+        AtomicBoolean cancelled = new AtomicBoolean(false);
 
         // putIfAbsent ensures we don't stomp a concurrent entry from unload() cancellation.
-        if (loading.putIfAbsent(pos, placeholder) != null) {
+        if (loading.putIfAbsent(pos, cancelled) != null) {
             // Another task is already loading this chunk.
             return;
         }
 
         CompletableFuture.<FakeChunk>supplyAsync(() -> {
             try {
-                if (world.getChunkProvider().getLoadedChunk(x, z) != null) {
+                if (cancelled.get()) {
                     return null;
                 }
 
@@ -367,16 +399,25 @@ public class ChunkManager {
                 return null;
             }
         }, executor).thenAccept(fake -> {
-            if (fake != null) {
+            if (fake != null && !cancelled.get()) {
                 Minecraft.getMinecraft().addScheduledTask(() -> {
+                    // Re-check cancellation on the main thread: unload() could have
+                    // flipped the flag in the gap between this check and
+                    // addScheduledTask actually running.
+                    //
+                    // Also re-check getLoadedChunk() here instead of in the
+                    // background task above - this is the main thread, so it's safe,
+                    // and it's the freshest point available before actually publishing.
+                    if (cancelled.get() || world.getChunkProvider().getLoadedChunk(x, z) != null) {
+                        return;
+                    }
                     fakeChunks.put(pos, fake);
                     pendingRenderUpdates.add(new ChunkPos(x, z));
                     totalLoaded.incrementAndGet();
                 });
             }
         }).whenComplete((v, ex) -> {
-            loading.remove(pos, placeholder); // only remove if still our placeholder
-            placeholder.complete(null);
+            loading.remove(pos, cancelled); // only remove if still our flag
             if (ex != null) {
                 Bobby.LOGGER.debug("Chunk loading error at " + x + ", " + z, ex);
                 failedLoads.incrementAndGet();
@@ -407,6 +448,17 @@ public class ChunkManager {
         visitedChunks.add(pos);
         knownChunks.add(pos);
 
+        /**
+         * FIX (stale FakeChunk after a real-chunk round-trip): a FakeChunk built from
+         * older cached data can still be sitting in fakeChunks for this position (e.g.
+         * it was shown while the server hadn't sent this chunk yet). Now that the real
+         * chunk has loaded, that FakeChunk is superseded - remove it so that if this
+         * position unloads again later, scheduleReload()'s "!fakeChunks.containsKey(pos)"
+         * guard sees no stale entry and queues a fresh reload from the data cached below,
+         * instead of silently resurrecting the old, now-outdated snapshot.
+         */
+        fakeChunks.remove(pos);
+
         executor.execute(() -> {
             try {
                 NBTTagCompound nbt = storage.serialize(chunk);
@@ -423,9 +475,11 @@ public class ChunkManager {
     public void unload(int x, int z) {
         long pos = ChunkPos.asLong(x, z);
 
-        CompletableFuture<?> future = loading.remove(pos);
-        if (future != null) {
-            future.cancel(true);
+        AtomicBoolean cancelled = loading.remove(pos);
+        if (cancelled != null) {
+            // Signals the in-flight loadAsync() task (if any) to bail out at its next
+            // check instead of resurrecting this position after we've just evicted it.
+            cancelled.set(true);
         }
 
         FakeChunk fake = fakeChunks.remove(pos);
@@ -466,6 +520,9 @@ public class ChunkManager {
         return fakeChunks.get(ChunkPos.asLong(x, z));
     }
 
+    /** Main thread waits at most this long for the shutdown drain below to finish. */
+    private static final long SHUTDOWN_DRAIN_BUDGET_MS = 3000;
+
     public void shutdown() {
         /**
          * FIX (Bug 3a): Guard against double-shutdown. Both MinecraftMixin.onShutdown and
@@ -478,41 +535,76 @@ public class ChunkManager {
             return;
         }
 
-        loading.values().forEach(f -> f.cancel(true));
+        loading.values().forEach(flag -> flag.set(true));
         loading.clear();
 
         // Stop the auto-save scheduler first so it doesn't interfere with the final flush.
         scheduler.shutdownNow();
         parallelPool.shutdownNow();
+        executor.shutdown();
 
         /**
-         * FIX (Bug 3b): Shut down the executor and wait for in-flight serialization to
-         * finish BEFORE flushing. If we flush first and an executor task completes after,
-         * its saveAsync() call adds entries to pending that are never written (silent data
-         * loss).
+         * FIX (main-thread stall on quit): waiting for the executor to terminate and then
+         * flushing pending saves used to happen right here, synchronously, on whichever
+         * thread called shutdown() - which is always the main thread (MinecraftMixin at
+         * full game exit, WorldClientMixin on disconnect). With a decent backlog of
+         * in-flight loads or unsaved chunks, that's a multi-second main-thread stall -
+         * worse on a full game exit, where there's no "Saving world" overlay the way
+         * vanilla's own world-save screen provides to explain the pause.
+         *
+         * Fix: do the actual waiting-and-flushing on a background daemon thread, and give
+         * it a firm, short budget from the main thread's point of view
+         * (SHUTDOWN_DRAIN_BUDGET_MS) instead of the effectively unbounded wait this had
+         * before (10s executor termination, then however long flush() took on top of
+         * that). If the drain finishes within budget, shutdown() has flushed everything
+         * by the time it returns, same as before. If it doesn't, we stop waiting and let
+         * the game continue closing/disconnecting; the drain thread keeps running on a
+         * best-effort basis regardless.
+         *
+         * This trade is reasonable because what's at risk is only Bobby's own fake-chunk
+         * cache, never real world save data - anything not flushed in time just gets
+         * rebuilt the next time that area is visited. The thread is a daemon specifically
+         * so it can never hold the JVM open waiting on its own completion.
          */
-        executor.shutdown();
-        try {
-            if (!executor.awaitTermination(10, TimeUnit.SECONDS)) {
-                Bobby.LOGGER.warn("Executor did not terminate in time; some chunk data may be lost");
+        Thread drainThread = new Thread(() -> {
+            // Must finish waiting for the executor before flushing: if flush() ran first
+            // and an executor task completed afterward, its saveAsync() call would add an
+            // entry to pending that never gets written (silent data loss).
+            try {
+                if (!executor.awaitTermination(10, TimeUnit.SECONDS)) {
+                    Bobby.LOGGER.warn("Executor did not terminate in time; some chunk data may be lost");
+                    executor.shutdownNow();
+                }
+            } catch (InterruptedException e) {
                 executor.shutdownNow();
+                Thread.currentThread().interrupt();
             }
+
+            try {
+                int pending = storage.getPendingCount();
+                if (pending > 0) {
+                    Bobby.LOGGER.info("Flushing " + pending + " pending chunk saves...");
+                    storage.flush();
+                }
+            } catch (Exception e) {
+                Bobby.LOGGER.error("Failed to flush pending saves", e);
+            }
+
+            Bobby.LOGGER.info("Bobby shutdown complete");
+        }, "Bobby-Shutdown-Drain");
+        drainThread.setDaemon(true);
+        drainThread.start();
+
+        try {
+            drainThread.join(SHUTDOWN_DRAIN_BUDGET_MS);
         } catch (InterruptedException e) {
-            executor.shutdownNow();
             Thread.currentThread().interrupt();
         }
 
-        try {
-            int pending = storage.getPendingCount();
-            if (pending > 0) {
-                Bobby.LOGGER.info("Flushing " + pending + " pending chunk saves...");
-                storage.flush();
-            }
-        } catch (Exception e) {
-            Bobby.LOGGER.error("Failed to flush pending saves", e);
+        if (drainThread.isAlive()) {
+            Bobby.LOGGER.warn("Chunk save flush still running after " + SHUTDOWN_DRAIN_BUDGET_MS
+                + "ms; continuing in the background instead of blocking further");
         }
-
-        Bobby.LOGGER.info("Bobby shutdown complete");
     }
 
     public String getDebugInfo() {

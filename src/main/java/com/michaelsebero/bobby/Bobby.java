@@ -26,6 +26,10 @@ public class Bobby {
     @Mod.EventHandler
     public void preinit(FMLPreInitializationEvent event) {
         MinecraftForge.EVENT_BUS.register(this);
+        // Freezes distant living entities beyond simulationDistance. Registered here
+        // (not via Mixin) because it hooks LivingUpdateEvent - see EntityFreezeHandler
+        // for why this replaced the old EntityTickingMixin.
+        MinecraftForge.EVENT_BUS.register(new EntityFreezeHandler());
     }
 
     @SubscribeEvent

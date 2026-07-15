@@ -23,23 +23,32 @@ public class ChunkStorage extends AnvilChunkLoader {
     private final AtomicInteger saveCounter = new AtomicInteger(0);
 
     /**
-     * FIX: regionCache is wrapped with Collections.synchronizedMap, which only synchronizes
-     * *individual* method calls, not compound operations. The previous getRegionFile had a
-     * classic check-then-act race: two executor threads could both call get() and see null,
-     * then both open the same RegionFile and put conflicting instances into the map, leading
-     * to corruption and resource leaks.
+     * FIX: regionCache's get-or-create (getRegionFileByRegionCoords) is fully guarded by
+     * synchronizing on the map itself, making the get-check-create-put sequence atomic and
+     * preventing two threads from both seeing no entry and opening the same RegionFile.
      *
-     * All access to regionCache now goes through synchronized blocks on the map itself,
-     * making the get-check-create-put sequence atomic.
+     * Actual chunk I/O (getChunkDataInputStream/getChunkDataOutputStream) synchronizes on
+     * the specific RegionFile instance instead of the map - see load()/save()/
+     * getStoredChunks(). A single map-wide lock for every read/write serialized I/O across
+     * every region file at once, even when threads were touching entirely unrelated
+     * regions. Locking per-region lets independent regions proceed in parallel while still
+     * fully serializing access to any one physical file.
+     *
+     * Because of that, eviction below must take the evicted RegionFile's own lock before
+     * closing it - otherwise a close() here could run concurrently with another thread
+     * still inside a synchronized(region) I/O block for that same instance.
      */
     private final Map<String, RegionFile> regionCache = new LinkedHashMap<String, RegionFile>(16, 0.75f, true) {
         @Override
         protected boolean removeEldestEntry(Map.Entry<String, RegionFile> eldest) {
             if (size() > 64) {
-                try {
-                    eldest.getValue().close();
-                } catch (IOException e) {
-                    Bobby.LOGGER.debug("Failed to close region file", e);
+                RegionFile evicted = eldest.getValue();
+                synchronized (evicted) {
+                    try {
+                        evicted.close();
+                    } catch (IOException e) {
+                        Bobby.LOGGER.debug("Failed to close region file", e);
+                    }
                 }
                 return true;
             }
@@ -84,8 +93,18 @@ public class ChunkStorage extends AnvilChunkLoader {
     }
 
     private RegionFile getRegionFile(int chunkX, int chunkZ) throws IOException {
-        int regionX = chunkX >> 5;
-        int regionZ = chunkZ >> 5;
+        return getRegionFileByRegionCoords(chunkX >> 5, chunkZ >> 5);
+    }
+
+    /**
+     * Same get-or-create-and-cache logic as getRegionFile(), keyed directly by region
+     * coordinates instead of chunk coordinates. getRegionFile() itself delegates here.
+     *
+     * Also used by getStoredChunks(), which parses region coordinates straight out of
+     * each .mca filename and would otherwise have to fabricate a fake chunk coordinate
+     * just to call back into the chunk-coordinate overload above.
+     */
+    private RegionFile getRegionFileByRegionCoords(int regionX, int regionZ) throws IOException {
         String key = regionX + "," + regionZ;
 
         // Synchronize the entire compound operation to prevent two threads from
@@ -106,10 +125,12 @@ public class ChunkStorage extends AnvilChunkLoader {
     private void closeAllRegions() {
         synchronized (regionCache) {
             for (RegionFile region : regionCache.values()) {
-                try {
-                    region.close();
-                } catch (IOException e) {
-                    Bobby.LOGGER.debug("Failed to close region file", e);
+                synchronized (region) {
+                    try {
+                        region.close();
+                    } catch (IOException e) {
+                        Bobby.LOGGER.debug("Failed to close region file", e);
+                    }
                 }
             }
             regionCache.clear();
@@ -130,7 +151,6 @@ public class ChunkStorage extends AnvilChunkLoader {
         }
 
         Arrays.stream(regionFiles).parallel().forEach(regionFile -> {
-            RegionFile region = null;
             try {
                 String name = regionFile.getName();
                 String[] parts = name.replace(".mca", "").split("\\.");
@@ -139,13 +159,31 @@ public class ChunkStorage extends AnvilChunkLoader {
                 int regionX = Integer.parseInt(parts[1]);
                 int regionZ = Integer.parseInt(parts[2]);
 
-                region = new RegionFile(regionFile);
+                /**
+                 * FIX: this used to open a brand new RegionFile(regionFile) here,
+                 * completely bypassing regionCache/getRegionFile(). This scan runs at
+                 * startup via ChunkManager.discoverKnownChunks(), potentially while
+                 * loads/saves are already streaming through the cached path for the
+                 * same on-disk files - so this could end up with two independent,
+                 * unsynchronized RegionFile instances open on the same underlying
+                 * .mca file at once, each with its own in-memory view of that file's
+                 * header/sector table. Routing through the same cache as every other
+                 * read/write means there's only ever one RegionFile per physical file.
+                 *
+                 * Do NOT close the returned RegionFile here - it's shared/cached, and
+                 * closing it would pull it out from under any other in-flight load or
+                 * save using the same cache entry. The cache's own LRU eviction
+                 * (removeEldestEntry, above) owns closing region files.
+                 */
+                RegionFile region = getRegionFileByRegionCoords(regionX, regionZ);
 
                 for (int cx = 0; cx < 32; cx++) {
                     for (int cz = 0; cz < 32; cz++) {
                         DataInputStream in = null;
                         try {
-                            in = region.getChunkDataInputStream(cx, cz);
+                            synchronized (region) {
+                                in = region.getChunkDataInputStream(cx, cz);
+                            }
                             if (in != null) {
                                 int chunkX = (regionX << 5) + cx;
                                 int chunkZ = (regionZ << 5) + cz;
@@ -163,12 +201,6 @@ public class ChunkStorage extends AnvilChunkLoader {
                 }
             } catch (Exception e) {
                 Bobby.LOGGER.debug("Failed to scan region file: " + regionFile.getName(), e);
-            } finally {
-                if (region != null) {
-                    try { region.close(); } catch (IOException e) {
-                        Bobby.LOGGER.debug("Failed to close region file", e);
-                    }
-                }
             }
         });
 
@@ -180,7 +212,7 @@ public class ChunkStorage extends AnvilChunkLoader {
         try {
             RegionFile region = getRegionFile(pos.x, pos.z);
             DataInputStream in;
-            synchronized (regionCache) {
+            synchronized (region) {
                 in = region.getChunkDataInputStream(pos.x & 31, pos.z & 31);
             }
 
@@ -287,7 +319,7 @@ public class ChunkStorage extends AnvilChunkLoader {
             try {
                 RegionFile region = getRegionFile(x, z);
                 DataOutputStream out;
-                synchronized (regionCache) {
+                synchronized (region) {
                     out = region.getChunkDataOutputStream(x & 31, z & 31);
                 }
 

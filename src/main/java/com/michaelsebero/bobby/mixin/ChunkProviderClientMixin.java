@@ -9,6 +9,7 @@ import com.michaelsebero.bobby.ext.IChunkProviderClient;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.multiplayer.ChunkProviderClient;
 import net.minecraft.client.multiplayer.WorldClient;
+import net.minecraft.client.network.NetHandlerPlayClient;
 import net.minecraft.world.World;
 import net.minecraft.world.chunk.Chunk;
 import org.spongepowered.asm.mixin.*;
@@ -17,6 +18,7 @@ import org.spongepowered.asm.mixin.injection.callback.*;
 
 import javax.annotation.Nullable;
 import java.io.File;
+import java.net.SocketAddress;
 
 @Mixin(ChunkProviderClient.class)
 public class ChunkProviderClientMixin implements IChunkProviderClient {
@@ -127,6 +129,32 @@ public class ChunkProviderClientMixin implements IChunkProviderClient {
         if (Minecraft.getMinecraft().getCurrentServerData() != null) {
             String serverIP = Minecraft.getMinecraft().getCurrentServerData().serverIP;
             return sanitizeFileName(serverIP.replace(':', '_'));
+        }
+
+        /**
+         * FIX (unknown-fallback cache contamination): getCurrentServerData() is only
+         * populated for servers added through the multiplayer server list / direct
+         * connect screen. Other ways of ending up connected to a remote world - Realms
+         * chief among them - don't necessarily populate it, and this used to fall
+         * straight through to a single hardcoded "unknown" directory shared by every
+         * such connection. Two different servers hitting this path would then read
+         * and write the exact same .bobby/unknown/<dimension> cache and show each
+         * other's cached terrain.
+         *
+         * Fix: before giving up entirely, fall back to the live connection's actual
+         * remote socket address. This identifies the remote endpoint from the network
+         * layer itself, so it doesn't matter how the connection was established.
+         */
+        NetHandlerPlayClient connection = Minecraft.getMinecraft().getConnection();
+        if (connection != null) {
+            try {
+                SocketAddress remoteAddress = connection.getNetworkManager().getRemoteAddress();
+                if (remoteAddress != null) {
+                    return sanitizeFileName(remoteAddress.toString());
+                }
+            } catch (Exception e) {
+                Bobby.LOGGER.debug("Failed to read remote address for cache directory naming", e);
+            }
         }
 
         return "unknown";
