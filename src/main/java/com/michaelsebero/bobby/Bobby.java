@@ -19,9 +19,6 @@ public class Bobby {
 
     @Mod.Instance(MOD_ID)
     public static Bobby INSTANCE;
-    
-    // Storage for entity tracking original values
-    public final EntityTrackerStorage entityStorage = new EntityTrackerStorage();
 
     @Mod.EventHandler
     public void preinit(FMLPreInitializationEvent event) {

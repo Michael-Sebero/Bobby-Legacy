@@ -258,10 +258,24 @@ public class ChunkManager {
                 }
             }
         }
+        /**
+         * FIX (unthrottled eviction burst): this used to call unload(cx, cz) directly
+         * here, for every position in toEvict, all in one synchronous pass with no cap -
+         * unlike the load side just above, which caps toLoad at 50 per scan specifically
+         * to avoid doing too much at once. Each unload() that finds a FakeChunk present
+         * schedules a markBlockRangeForRenderUpdate call via addScheduledTask. A large
+         * teleport, or dropping renderDistance while a lot of area is cached, could evict
+         * thousands of positions in a single updateChunks() pass - which meant thousands
+         * of render-update calls all bursting onto the very next tick at once.
+         *
+         * unloadQueue and its throttle in processQueues() (maxUnload = chunksPerTick * 6)
+         * already existed for exactly this - they just were never fed. Queuing here
+         * instead of unloading immediately spreads that same burst across multiple ticks.
+         */
         for (long packed : toEvict) {
             int cx = (int) packed;
             int cz = (int) (packed >> 32);
-            unload(cx, cz);
+            unloadQueue.add(new ChunkPos(cx, cz));
         }
     }
 

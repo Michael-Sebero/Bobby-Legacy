@@ -1,6 +1,5 @@
 package com.michaelsebero.bobby.mixin;
 
-import com.michaelsebero.bobby.Bobby;
 import com.michaelsebero.bobby.BobbyConfig;
 import net.minecraft.entity.Entity;
 import net.minecraft.entity.EntityTrackerEntry;
@@ -21,17 +20,13 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 public class EntityTrackerEntryMixin {
     @Shadow @Final @Mutable private int range;
     @Shadow @Final @Mutable private int maxRange;
-    @Shadow @Final private Entity trackedEntity;
-    
+
     @Inject(method = "<init>", at = @At("RETURN"))
     private void extendTrackingDistance(Entity entityIn, int rangeIn, int maxRangeIn, int updateFrequencyIn, boolean sendVelocityUpdatesIn, CallbackInfo ci) {
         if (!BobbyConfig.enabled) {
             return;
         }
-        
-        // Store original values for potential restoration
-        Bobby.INSTANCE.entityStorage.storeInitValues(entityIn, rangeIn, maxRangeIn);
-        
+
         // Calculate multiplier based on render distance
         // Vanilla max tracking is typically tied to 32 chunk view distance
         int vanillaMaxDistance = 32;
