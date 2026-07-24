@@ -208,8 +208,24 @@ public class ChunkManager {
     }
 
     private void updateChunks() {
-        int renderDist = Math.min(Minecraft.getMinecraft().gameSettings.renderDistanceChunks,
-            BobbyConfig.renderDistance);
+        /**
+         * FIX (OptiFine chunk-caching dead zone): this used to clamp renderDist to
+         * Math.min(gameSettings.renderDistanceChunks, BobbyConfig.renderDistance).
+         * That ties Bobby's core load range to a live vanilla field that other code can
+         * reset independently of Bobby's own config - see the matching fix in
+         * GameSettingsMixin for why OptiFine in particular does this routinely (its
+         * video settings screen and the vanilla F3+F hotkey both funnel through
+         * GameSettings.setOptionValue, which re-clamps renderDistanceChunks to vanilla's
+         * hardcoded max on every call, independent of what Bobby is configured for).
+         *
+         * When that live field collapses to at or below simulationDistance,
+         * shouldLoadChunk() can never be satisfied for any position - the loop below
+         * queues nothing, every position fails the check, and Bobby silently stops
+         * caching entirely with no exception anywhere to log. BobbyConfig.renderDistance
+         * is Bobby's own authoritative setting; restoreCachedChunksAroundPlayerParallel()
+         * already uses it alone, unclamped. Do the same here.
+         */
+        int renderDist = BobbyConfig.renderDistance;
         int simDist = BobbyConfig.simulationDistance;
 
         List<ChunkPos> toLoad = new ArrayList<>();
