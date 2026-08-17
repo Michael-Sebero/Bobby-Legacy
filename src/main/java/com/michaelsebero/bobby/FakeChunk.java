@@ -1,10 +1,8 @@
 package com.michaelsebero.bobby;
 
 import net.minecraft.block.state.IBlockState;
-import net.minecraft.entity.Entity;
 import net.minecraft.init.Blocks;
 import net.minecraft.tileentity.TileEntity;
-import net.minecraft.util.ClassInheritanceMultiMap;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.world.EnumSkyBlock;
 import net.minecraft.world.World;
@@ -18,8 +16,6 @@ import java.util.HashMap;
 import java.util.Map;
 
 public class FakeChunk extends Chunk {
-
-    private static final ClassInheritanceMultiMap<Entity>[] EMPTY_ENTITY_ARRAY = createEmptyEntityArray();
 
     /**
      * Reflection handle for ExtendedBlockStorage.blockRefCount.
@@ -99,15 +95,6 @@ public class FakeChunk extends Chunk {
 
     private final Map<BlockPos, TileEntity> frozenTileEntities = new HashMap<>();
 
-    @SuppressWarnings("unchecked")
-    private static ClassInheritanceMultiMap<Entity>[] createEmptyEntityArray() {
-        ClassInheritanceMultiMap<Entity>[] array = new ClassInheritanceMultiMap[16];
-        for (int i = 0; i < 16; i++) {
-            array[i] = new ClassInheritanceMultiMap<>(Entity.class);
-        }
-        return array;
-    }
-
     public FakeChunk(World world, int x, int z) {
         super(world, x, z);
     }
@@ -181,6 +168,14 @@ public class FakeChunk extends Chunk {
 
     @Override
     public void onUnload() {
+        /**
+         * FIX: previously didn't call super.onUnload(), so any entities left indexed in
+         * this chunk's entityLists (see the addEntity/getEntityLists fix below) never got
+         * handed to World.unloadEntities() on eviction - they'd end up indexed on a chunk
+         * object nothing references anymore instead of being cleanly unloaded the normal
+         * way.
+         */
+        super.onUnload();
         frozenTileEntities.clear();
     }
 
@@ -209,23 +204,31 @@ public class FakeChunk extends Chunk {
     @Override
     public void checkLight() { }
 
-    @Override
-    public void addEntity(Entity entity) { }
-
-    @Override
-    public void removeEntity(Entity entity) { }
-
-    @Override
-    public void removeEntityAtIndex(Entity entity, int index) { }
+    /**
+     * FIX (mobs going permanently invisible after leaving and re-entering render range):
+     * addEntity/removeEntity/removeEntityAtIndex/getEntityLists used to be no-ops here,
+     * mirroring vanilla EmptyChunk (the shared blankChunk placeholder for "nothing here").
+     * That's correct for EmptyChunk, a singleton nothing should ever really be positioned
+     * in - but wrong for FakeChunk, which holds real deserialized terrain and, per design,
+     * can legitimately have entities in it (frozen beyond simulationDistance, still visible
+     * out to renderDistance thanks to EntityTrackerEntryMixin's extended tracking).
+     *
+     * With those overrides removed, every tick the world's entity-tick loop re-associates a
+     * moving entity with whatever chunk is currently returned for its position, same as it
+     * would for a real Chunk. When that position is a FakeChunk, the entity now actually
+     * gets indexed into it via Chunk's own entityLists array (already initialized by
+     * super(world, x, z)) instead of being silently dropped. Chunk-aware entity culling
+     * (e.g. tr7zw's Entity Culling, commonly paired with Bobby, which needs a matching
+     * OptiFine build to even run) reads exactly this per-chunk index to decide what's worth
+     * drawing - so an entity that fell out of it stayed fully alive (hittable, audible,
+     * still ticking) but never got rendered again, even once the player came back within
+     * range, because that reindex only fires when the entity's own chunk coordinate
+     * changes, not just because the player moved.
+     */
 
     @Override
     public boolean isEmpty() {
         return false;
-    }
-
-    @Override
-    public ClassInheritanceMultiMap<Entity>[] getEntityLists() {
-        return EMPTY_ENTITY_ARRAY;
     }
 
     @Override
